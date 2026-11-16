@@ -4,6 +4,15 @@ import { withSelectorKey } from '@/test/i18n-mock'
 import { UserActionButtonType } from '../../human-input/shared/types'
 import humanInputV2Default from '../default'
 
+const mockHitlIm = vi.hoisted(() => ({ enabled: true }))
+
+vi.mock('@/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config')>()),
+  get ENABLE_HITL_IM() {
+    return mockHitlIm.enabled
+  },
+}))
+
 const createPayload = (overrides: Partial<HumanInputV2NodeType> = {}): HumanInputV2NodeType =>
   ({
     title: 'Human Input v2',
@@ -14,6 +23,10 @@ const createPayload = (overrides: Partial<HumanInputV2NodeType> = {}): HumanInpu
   }) as HumanInputV2NodeType
 
 describe('Human Input v2 default', () => {
+  beforeEach(() => {
+    mockHitlIm.enabled = true
+  })
+
   it('uses the complete frontend wire shape', () => {
     expect(humanInputV2Default.metaData.type).toBe(BlockEnum.HumanInputV2)
     expect(humanInputV2Default.defaultValue).toEqual({
@@ -33,13 +46,14 @@ describe('Human Input v2 default', () => {
   it('preserves the recipients key and nested values through a JSON round trip', () => {
     const payload = createPayload({
       recipients_spec: [
+        { type: 'all_workspace_contacts' },
         { type: 'initiator' },
         { type: 'contact', contact_id: 'contact-1' },
         { type: 'dynamic_email', selector: ['start', 'email'] },
         { type: 'onetime_email', email: 'owner@example.com' },
       ],
       message_template: { subject: 'Review', body: 'Please review {{#start.email#}}' },
-      debug_mode: { enabled: true, channels: ['email', 'slack'] },
+      debug_mode: { enabled: true, channels: ['email', 'lark'] },
     })
 
     const roundTripped = JSON.parse(JSON.stringify(payload)) as HumanInputV2NodeType
@@ -62,11 +76,11 @@ describe('Human Input v2 default', () => {
     expect(createPayload()).not.toHaveProperty('delivery_methods')
   })
 
-  it('accepts a complete template without the v1 request URL token', () => {
+  it('accepts a complete template containing exactly one Request URL', () => {
     const result = humanInputV2Default.checkValid(
       createPayload({
         recipients_spec: [{ type: 'initiator' }],
-        message_template: { subject: 'Review request', body: 'Please review this request' },
+        message_template: { subject: 'Review request', body: 'Please review {{#url#}}' },
         user_actions: [
           { id: 'approve', title: 'Approve', button_style: UserActionButtonType.Primary },
         ],
@@ -77,11 +91,63 @@ describe('Human Input v2 default', () => {
     expect(result).toEqual({ isValid: true, errorMessage: '' })
   })
 
+  it('rejects an imported user action that uses the system timeout handle', () => {
+    const result = humanInputV2Default.checkValid(
+      createPayload({
+        recipients_spec: [{ type: 'initiator' }],
+        message_template: { subject: 'Review request', body: 'Please review {{#url#}}' },
+        user_actions: [
+          { id: '__timeout', title: 'Approve', button_style: UserActionButtonType.Primary },
+        ],
+      }),
+      withSelectorKey((key: string) => key, 'workflow'),
+    )
+
+    expect(result).toEqual({
+      isValid: false,
+      errorMessage: 'nodes.humanInput.errorMsg.reservedActionId',
+    })
+  })
+
+  it.each(['__timeout__', '__timeout_review'])('accepts the distinct user action ID %s', (id) => {
+    const result = humanInputV2Default.checkValid(
+      createPayload({
+        recipients_spec: [{ type: 'initiator' }],
+        message_template: { subject: 'Review request', body: 'Please review {{#url#}}' },
+        user_actions: [{ id, title: 'Approve', button_style: UserActionButtonType.Primary }],
+      }),
+      withSelectorKey((key: string) => key, 'workflow'),
+    )
+
+    expect(result).toEqual({ isValid: true, errorMessage: '' })
+  })
+
+  it.each([
+    ['Please review this request', 'requestURLRequired'],
+    ['{{#start.email#}} {{#url#}} {{#url#}}', 'requestURLDuplicate'],
+  ])('rejects an invalid Request URL count in %s before running', (body, error) => {
+    const result = humanInputV2Default.checkValid(
+      createPayload({
+        recipients_spec: [{ type: 'initiator' }],
+        message_template: { subject: 'Review request', body },
+        user_actions: [
+          { id: 'approve', title: 'Approve', button_style: UserActionButtonType.Primary },
+        ],
+      }),
+      withSelectorKey((key: string) => key, 'workflow'),
+    )
+
+    expect(result).toEqual({
+      isValid: false,
+      errorMessage: `nodes.humanInputV2.error.${error}`,
+    })
+  })
+
   it('validates duplicate recipients and enabled Debug Mode channels', () => {
     const t = withSelectorKey((key: string) => key, 'workflow')
     const complete = {
       recipients_spec: [{ type: 'initiator' }] as HumanInputV2NodeType['recipients_spec'],
-      message_template: { subject: 'Review', body: 'Body' },
+      message_template: { subject: 'Review', body: 'Body {{#url#}}' },
       user_actions: [
         { id: 'approve', title: 'Approve', button_style: UserActionButtonType.Primary },
       ],
@@ -103,4 +169,48 @@ describe('Human Input v2 default', () => {
       ).errorMessage,
     ).toBe('nodes.humanInputV2.error.debugChannelRequired')
   })
+
+  it('validates migrated whole-workspace delivery with Lark and rejects duplicated whole-workspace recipients', () => {
+    const payload = createPayload({
+      recipients_spec: [{ type: 'all_workspace_contacts' }],
+      debug_mode: { enabled: true, channels: ['lark'] },
+      message_template: { subject: 'Review request', body: 'Please review {{#url#}}' },
+      user_actions: [
+        { id: 'approve', title: 'Approve', button_style: UserActionButtonType.Primary },
+      ],
+    })
+    const t = withSelectorKey((key: string) => key, 'workflow')
+    expect(humanInputV2Default.checkValid(payload, t)).toEqual({ isValid: true, errorMessage: '' })
+    expect(
+      humanInputV2Default.checkValid(
+        {
+          ...payload,
+          recipients_spec: [{ type: 'all_workspace_contacts' }, { type: 'all_workspace_contacts' }],
+        },
+        t,
+      ).errorMessage,
+    ).toBe('nodes.humanInputV2.error.recipientDuplicate')
+  })
+})
+
+it('rejects a stored v2 configuration when disabled without converting or clearing it', () => {
+  mockHitlIm.enabled = false
+  const payload = createPayload({
+    recipients_spec: [{ type: 'contact', contact_id: 'stored-contact' }],
+    message_template: { subject: 'Review', body: 'Please review {{#url#}}' },
+    user_actions: [{ id: 'approve', title: 'Approve', button_style: UserActionButtonType.Primary }],
+  })
+  const original = structuredClone(payload)
+
+  expect(
+    humanInputV2Default.checkValid(
+      payload,
+      withSelectorKey((key: string) => key, 'workflow'),
+    ),
+  ).toEqual({
+    isValid: false,
+    errorMessage: 'nodes.humanInputV2.disabled',
+  })
+  expect(payload).toEqual(original)
+  expect(payload).not.toHaveProperty('delivery_methods')
 })

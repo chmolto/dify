@@ -1,15 +1,31 @@
 import type { CommonNodeType, Node } from '@/app/components/workflow/types'
-import { describe, expect, it } from 'vitest'
-import { BlockEnum } from '@/app/components/workflow/types'
+import { describe, expect, it } from 'vite-plus/test'
+import { BlockEnum, InputVarType } from '@/app/components/workflow/types'
+import { createDefaultFormInputByType } from '../../../human-input/types'
 import {
+  canInsertHumanInput,
+  canInsertHumanInputNodes,
   classifyHumanInputVersion,
   getHumanInputCreationPolicy,
+  getHumanInputInsertionBlocker,
+  getHumanInputNodesInsertionBlocker,
   HumanInputVersionKind,
   isLegacyHumanInputNodeData,
-  isMigrationEligibleHumanInputNodeData,
 } from '../policy'
 
-const data = (version?: unknown, type = BlockEnum.HumanInput) =>
+const releaseGate = vi.hoisted(() => ({ enabled: true }))
+vi.mock('@/config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/config')>()),
+  get ENABLE_HITL_IM() {
+    return releaseGate.enabled
+  },
+}))
+
+beforeEach(() => {
+  releaseGate.enabled = true
+})
+
+const data = (version?: unknown, type: BlockEnum = BlockEnum.HumanInput) =>
   ({
     type,
     title: 'Human Input',
@@ -19,16 +35,44 @@ const data = (version?: unknown, type = BlockEnum.HumanInput) =>
 const node = (version?: unknown): Pick<Node, 'data'> => ({ data: data(version) })
 
 describe('Human Input migration policy', () => {
+  it('restores legacy creation and repeated insertion when the release gate is off', () => {
+    releaseGate.enabled = false
+
+    expect(getHumanInputCreationPolicy([], true)).toMatchObject({
+      canAddHumanInputV2: false,
+      canAddLegacyHumanInput: true,
+    })
+    expect(canInsertHumanInput([], BlockEnum.HumanInput)).toBe(true)
+    expect(canInsertHumanInput([node(), node('1')], BlockEnum.HumanInput)).toBe(true)
+    expect(canInsertHumanInputNodes([node()], [node(), node('1')])).toBe(true)
+    expect(getHumanInputCreationPolicy([node()], false).canAddLegacyHumanInput).toBe(false)
+  })
+
+  it('rejects new V2 nodes in all persisted and catalog shapes when the release gate is off', () => {
+    releaseGate.enabled = false
+
+    expect(canInsertHumanInput([], BlockEnum.HumanInputV2)).toBe(false)
+    expect(canInsertHumanInput([], BlockEnum.HumanInput, data('2'))).toBe(false)
+    expect(canInsertHumanInput([], BlockEnum.Code, data('2'))).toBe(false)
+    expect(canInsertHumanInputNodes([], [node('2')])).toBe(false)
+    expect(canInsertHumanInputNodes([], [{ data: data(undefined, BlockEnum.HumanInputV2) }])).toBe(
+      false,
+    )
+    expect(canInsertHumanInputNodes([], [node(), node('2')])).toBe(false)
+    expect(canInsertHumanInputNodes([node('2')], [node()])).toBe(false)
+    expect(canInsertHumanInputNodes([], [node('3')])).toBe(false)
+    expect(canInsertHumanInput([], BlockEnum.Code)).toBe(true)
+  })
+
   it.each([
-    [undefined, HumanInputVersionKind.LegacyEligible, true],
-    ['1', HumanInputVersionKind.LegacyEligible, true],
-    ['2', HumanInputVersionKind.V2, false],
-    [2, HumanInputVersionKind.LegacyBlocked, false],
-    ['3', HumanInputVersionKind.LegacyBlocked, false],
-    [null, HumanInputVersionKind.LegacyBlocked, false],
-  ])('classifies persisted version %p', (version, expectedKind, eligible) => {
+    [undefined, HumanInputVersionKind.LegacyEligible],
+    ['1', HumanInputVersionKind.LegacyEligible],
+    ['2', HumanInputVersionKind.V2],
+    [2, HumanInputVersionKind.LegacyBlocked],
+    ['3', HumanInputVersionKind.LegacyBlocked],
+    [null, HumanInputVersionKind.LegacyBlocked],
+  ])('classifies persisted version %p', (version, expectedKind) => {
     expect(classifyHumanInputVersion(data(version))).toBe(expectedKind)
-    expect(isMigrationEligibleHumanInputNodeData(data(version))).toBe(eligible)
     expect(isLegacyHumanInputNodeData(data(version))).toBe(
       expectedKind !== HumanInputVersionKind.V2,
     )
@@ -56,8 +100,66 @@ describe('Human Input migration policy', () => {
       expect(getHumanInputCreationPolicy(nodes, canEdit)).toEqual({
         hasLegacyHumanInput: hasLegacy,
         canAddHumanInputV2: canAdd,
+        canAddLegacyHumanInput: false,
         candidateCount: 1,
       })
     },
   )
+
+  it.each([
+    InputVarType.paragraph,
+    InputVarType.select,
+    InputVarType.singleFile,
+    InputVarType.multiFiles,
+  ])('keeps supported %s fields on the migration path when the release gate is on', (type) => {
+    const legacy = {
+      data: {
+        ...data(),
+        inputs: [createDefaultFormInputByType(type, 'decision')],
+      },
+    }
+
+    expect(canInsertHumanInput([legacy], BlockEnum.HumanInput)).toBe(false)
+    expect(canInsertHumanInput([legacy], BlockEnum.HumanInputV2)).toBe(false)
+    expect(canInsertHumanInput([legacy, node('2')], BlockEnum.HumanInput)).toBe(false)
+    expect(canInsertHumanInput([node()], BlockEnum.HumanInput)).toBe(false)
+  })
+
+  it('rejects mixed-version batches while allowing legacy-only batches when the release gate is off', () => {
+    releaseGate.enabled = false
+    const legacy = {
+      data: { ...data(), inputs: [createDefaultFormInputByType(InputVarType.select, 'decision')] },
+    }
+    expect(canInsertHumanInputNodes([legacy], [node()])).toBe(true)
+    expect(canInsertHumanInputNodes([legacy], [node('2')])).toBe(false)
+    expect(canInsertHumanInputNodes([], [node(), node('2')])).toBe(false)
+    expect(
+      canInsertHumanInputNodes([], [node(), { data: data(undefined, BlockEnum.HumanInputV2) }]),
+    ).toBe(false)
+    expect(canInsertHumanInputNodes([node('2')], [node()])).toBe(false)
+    expect(canInsertHumanInputNodes([legacy], [node('3')])).toBe(false)
+    expect(getHumanInputCreationPolicy([legacy], false).canAddLegacyHumanInput).toBe(false)
+  })
+
+  it('keeps backend-supported historical text_input fields on the migration path', () => {
+    const legacy = {
+      data: { ...data(), inputs: [{ type: 'text_input', output_variable_name: 'note' }] },
+    }
+    expect(getHumanInputCreationPolicy([legacy], true).canAddLegacyHumanInput).toBe(false)
+    expect(canInsertHumanInput([legacy], BlockEnum.HumanInput)).toBe(false)
+  })
+})
+
+it('distinguishes unsupported versions, migration requirements and incompatible version mixes', () => {
+  expect(getHumanInputInsertionBlocker([node()], BlockEnum.HumanInputV2)).toBe('migration-required')
+  expect(getHumanInputInsertionBlocker([node('2')], BlockEnum.HumanInput)).toBe(
+    'incompatible-versions',
+  )
+  expect(getHumanInputInsertionBlocker([], BlockEnum.HumanInput, data('3'))).toBe(
+    'unsupported-version',
+  )
+  expect(getHumanInputNodesInsertionBlocker([], [node(), node('2')])).toBe('incompatible-versions')
+  releaseGate.enabled = false
+  expect(getHumanInputInsertionBlocker([], BlockEnum.HumanInputV2)).toBe('disabled')
+  expect(getHumanInputInsertionBlocker([], BlockEnum.Code)).toBeUndefined()
 })

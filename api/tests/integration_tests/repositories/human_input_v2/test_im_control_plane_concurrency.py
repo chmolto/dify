@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration import ActiveRunDecisionKind
+from core.human_input_v2.im_integration.sync_records import SysUserId, SysUserIMSyncInitiator
 from core.human_input_v2.shared import ContactId, IMIdentityId, IMSyncRunId
 from extensions.ext_database import db
 from libs.datetime_utils import naive_utc_now
@@ -22,8 +23,8 @@ from models.human_input_v2 import (
     HumanInputIMReconciliationChange,
     HumanInputIMSyncResult,
     HumanInputIMSyncRun,
-    IMEncryptedCredentials,
 )
+from repositories.human_input_v2.channel_credentials import ChannelEncryptedCredentials
 from repositories.human_input_v2.im_binding_repository import IMBindingAssignment, IMBindingConflictError
 from repositories.human_input_v2.im_channel_repository import (
     IMChannel,
@@ -51,7 +52,7 @@ def _channel() -> IMChannel:
         updated_at=now,
         provider=IMProvider.FEISHU,
         provider_tenant_id=f"provider-{uuidv7()}",
-        encrypted_credentials=IMEncryptedCredentials(ciphertext="opaque-ciphertext"),
+        encrypted_credentials=ChannelEncryptedCredentials(ciphertext="opaque-ciphertext"),
         app_identifier="app-1",
         webhook_id=WebhookId(uuidv7().hex),
         config_version=1,
@@ -62,7 +63,7 @@ def _channel() -> IMChannel:
 def _cleanup(session_maker: sessionmaker[Session], channel_id: IMChannelId) -> None:
     with session_maker.begin() as session:
         run_ids = session.scalars(
-            sa.select(HumanInputIMSyncRun.id).where(HumanInputIMSyncRun.integration_id == str(channel_id))
+            sa.select(HumanInputIMSyncRun.id).where(HumanInputIMSyncRun.channel_id == str(channel_id))
         ).all()
         if run_ids:
             session.execute(
@@ -78,7 +79,7 @@ def _cleanup(session_maker: sessionmaker[Session], channel_id: IMChannelId) -> N
         )
         session.execute(sa.delete(HumanInputIMBinding).where(HumanInputIMBinding.channel_id == str(channel_id)))
         session.execute(sa.delete(HumanInputIMIdentity).where(HumanInputIMIdentity.channel_id == str(channel_id)))
-        session.execute(sa.delete(HumanInputIMSyncRun).where(HumanInputIMSyncRun.integration_id == str(channel_id)))
+        session.execute(sa.delete(HumanInputIMSyncRun).where(HumanInputIMSyncRun.channel_id == str(channel_id)))
         session.execute(sa.delete(HumanInputIMChannel).where(HumanInputIMChannel.id == str(channel_id)))
 
 
@@ -99,7 +100,7 @@ def test_concurrent_sync_triggers_create_at_most_one_active_run(flask_req_ctx: o
         with session_maker.begin() as session:
             decision = SQLAlchemyIMControlPlaneRepository(session, channel).create_or_get_active_run(
                 sync_run_id=IMSyncRunId(str(uuidv7())),
-                started_by_account_id=None,
+                started_by=SysUserIMSyncInitiator(SysUserId("00000000-0000-0000-0000-000000000999")),
                 now=naive_utc_now(),
             )
             return decision.kind
@@ -113,7 +114,7 @@ def test_concurrent_sync_triggers_create_at_most_one_active_run(flask_req_ctx: o
         with session_maker() as session:
             count = session.scalar(
                 sa.select(sa.func.count(HumanInputIMSyncRun.id)).where(
-                    HumanInputIMSyncRun.integration_id == str(channel.id)
+                    HumanInputIMSyncRun.channel_id == str(channel.id)
                 )
             )
         assert count == 1

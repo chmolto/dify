@@ -1,11 +1,13 @@
-import type { defaultNS, Namespace, Resources } from '../i18n-config/resources'
+import type { ParseKeysWithoutVariables } from 'i18next'
+import type { defaultNS, Namespace } from '../i18n/resources'
+import type Resources from '../i18n/resources.generated'
 import 'i18next'
 
 declare module 'i18next' {
-  // eslint-disable-next-line ts/consistent-type-definitions
   interface CustomTypeOptions {
     defaultNS: typeof defaultNS
     enableSelector: 'optimize'
+    returnEmptyString: true
     resources: Resources
     keySeparator: false
   }
@@ -22,3 +24,9 @@ export type I18nKeysByPrefix<NS extends Namespace, Prefix extends string = ''> =
 export type I18nKeysWithPrefix<NS extends Namespace, Prefix extends string = ''> = Prefix extends ''
   ? keyof Resources[NS]
   : Extract<keyof Resources[NS], `${Prefix}${string}`>
+
+// Labels translated without options must not require interpolation values.
+export type I18nKeysWithoutVariables<NS extends Namespace, Prefix extends string = ''> = Extract<
+  I18nKeysWithPrefix<NS, Prefix>,
+  ParseKeysWithoutVariables<NS>
+>

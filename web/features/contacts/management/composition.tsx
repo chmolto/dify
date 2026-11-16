@@ -1,78 +1,52 @@
 'use client'
 
 import type { ReactNode } from 'react'
-import type { ContactsMockScenarioDefinition } from './mock/scenarios'
-import type { ContactsManagementRepository } from './repository'
 import type { ContactsFeatureContextValue } from './types'
+import { useQuery } from '@tanstack/react-query'
 import { useAtomValue } from 'jotai'
 import { useMemo } from 'react'
 import { currentWorkspaceIdAtom, isCurrentWorkspaceManagerAtom } from '@/context/workspace-state'
 import { deploymentEditionAtom } from '@/features/system-features/state'
-import { ContactsFeatureContext, ContactsManagementRepositoryContext } from './composition-context'
-import { createContactsMockRepository } from './mock/repository'
-import { createContactsApiRepository } from './repository'
+import { consoleQuery } from '@/service/console'
+import { selectIMCentrallyManaged } from '../im-capability'
+import { ContactsFeatureContext } from './composition-context'
 
 export function ContactsManagementProvider({
   children,
   context,
-  repository,
 }: {
   children: ReactNode
   context: ContactsFeatureContextValue
-  repository: ContactsManagementRepository
 }) {
-  return (
-    <ContactsFeatureContext value={context}>
-      <ContactsManagementRepositoryContext value={repository}>
-        {children}
-      </ContactsManagementRepositoryContext>
-    </ContactsFeatureContext>
-  )
-}
-
-export function ContactsManagementMockProvider({
-  children,
-  scenario,
-  wait,
-}: {
-  children: ReactNode
-  scenario: ContactsMockScenarioDefinition
-  wait?: () => Promise<void>
-}) {
-  const context = useMemo<ContactsFeatureContextValue>(
-    () => ({
-      deployment: scenario.deployment,
-      permissions: scenario.permissions,
-      workspaceId: scenario.workspaceId,
-    }),
-    [scenario],
-  )
-  const repository = useMemo(
-    () => createContactsMockRepository({ scenario, wait }),
-    [scenario, wait],
-  )
-
-  return (
-    <ContactsManagementProvider context={context} repository={repository}>
-      {children}
-    </ContactsManagementProvider>
-  )
+  return <ContactsFeatureContext value={context}>{children}</ContactsFeatureContext>
 }
 
 export function ContactsManagementRuntimeProvider({ children }: { children: ReactNode }) {
   const workspaceId = useAtomValue(currentWorkspaceIdAtom)
   const canManage = useAtomValue(isCurrentWorkspaceManagerAtom)
   const deploymentEdition = useAtomValue(deploymentEditionAtom)
+  const capability = useQuery(
+    consoleQuery.features.get.queryOptions({
+      select: selectIMCentrallyManaged,
+      retry: false,
+    }),
+  )
+  const { error: capabilityError, refetch: refetchCapability } = capability
+  const imCentrallyManaged = capability.isSuccess ? capability.data : undefined
   const deployment =
     deploymentEdition === 'ENTERPRISE'
       ? 'ee'
       : deploymentEdition === 'CLOUD'
         ? 'saas'
         : ('ce' as const)
-  const repository = useMemo(() => createContactsApiRepository(), [])
   const context = useMemo<ContactsFeatureContextValue>(
     () => ({
       deployment,
+      imCentrallyManaged,
+      imCapabilityError: capabilityError,
+      retryIMCapability: () => {
+        void refetchCapability()
+      },
       workspaceId,
       permissions: {
         canViewContacts: Boolean(workspaceId) && canManage,
@@ -80,12 +54,7 @@ export function ContactsManagementRuntimeProvider({ children }: { children: Reac
         canManageMembers: Boolean(workspaceId) && canManage,
       },
     }),
-    [canManage, deployment, workspaceId],
+    [canManage, capabilityError, refetchCapability, deployment, imCentrallyManaged, workspaceId],
   )
-
-  return (
-    <ContactsManagementProvider key={workspaceId} context={context} repository={repository}>
-      {children}
-    </ContactsManagementProvider>
-  )
+  return <ContactsManagementProvider context={context}>{children}</ContactsManagementProvider>
 }

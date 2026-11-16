@@ -3,19 +3,28 @@
 The models use explicit logical owner references where database foreign keys are intentionally absent.
 Repository queries must therefore preserve complete owner predicates and explicit loading strategies.
 Current IM Identity and Binding rows use their Channel as the persistence boundary.
-Historical synchronization rows retain their existing Integration boundary.
+Historical synchronization rows retain their captured Channel references.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
 import sqlalchemy as sa
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, NaiveDatetime, RootModel, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    NaiveDatetime,
+    RootModel,
+    TypeAdapter,
+)
 from sqlalchemy import orm
-from sqlalchemy.orm import Mapped, MappedAsDataclass, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.human_input_v2.entities import (
     EmailProviderType as _EmailProviderType,
@@ -32,7 +41,9 @@ from core.human_input_v2.entities import (
 from core.human_input_v2.entities import (
     IMSyncRunStatus as _IMSyncRunStatus,
 )
-from core.human_input_v2.im_integration.adapters.entities import IMEventIngressKind as _IMEventIngressKind
+from core.human_input_v2.im_integration.adapters.entities import (
+    IMEventIngressKind as _IMEventIngressKind,
+)
 from core.human_input_v2.im_integration.change_log import (
     IMReconciliationOperation as _IMReconciliationOperation,
 )
@@ -40,8 +51,24 @@ from core.human_input_v2.im_integration.change_log import (
     IMReconciliationSubjectKind as _IMReconciliationSubjectKind,
 )
 from core.human_input_v2.im_message_inbox import IM_INBOX_PROVIDER_METADATA_MAX_LENGTH
+from core.human_input_v2.resolved_form import ResolvedForm
+from core.workflow.nodes.human_input.enums import (
+    HumanInputFormKind,
+    HumanInputFormStatus,
+)
+from core.workflow.nodes.human_input_v2.entities import RecipientConfig
 from libs.datetime_utils import naive_utc_now
 from libs.uuid_utils import uuidv7
+from repositories.human_input_v2.channel_credentials import ChannelEncryptedCredentials as _ChannelEncryptedCredentials
+from repositories.human_input_v2.delivery_attempt_repository import DeliveryStatus
+from repositories.human_input_v2.delivery_repository import (
+    DeliveryTargetType,
+    EmailTargetSnapshot,
+    IMUserTargetSnapshot,
+    InitiatorSnapshot,
+    SubmissionAuthType,
+    TargetSnapshot,
+)
 from repositories.human_input_v2.im_channel_repository import IMChannelStatus
 
 from .base import DefaultFieldsDCMixin, TypeBase
@@ -58,29 +85,6 @@ class _ImmutableJSONObject(RootModel[dict[str, JsonValue]]):
     """Strict immutable base for intentionally opaque JSON object payloads."""
 
     model_config = ConfigDict(frozen=True, strict=True, validate_default=True)
-
-
-class IMEncryptedCredentials(BaseModel):
-    """Versioned opaque credential envelope persisted for one IM Integration."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
-
-    version: Literal[1] = Field(default=1, description="Credential envelope format version.")
-    ciphertext: str = Field(
-        min_length=1,
-        repr=False,
-        description="Encrypted complete credential payload.",
-    )
-
-
-class ResendEmailProviderEncryptedCredentials(_ImmutableJSONModel):
-    """Encrypted credentials persisted for a Resend email provider."""
-
-    provider: Literal[_EmailProviderType.RESEND] = Field(
-        default=_EmailProviderType.RESEND,
-        description="Discriminator for Resend encrypted credentials.",
-    )
-    encrypted_api_key: str = Field(description="Encrypted Resend API key.")
 
 
 class IMIdentityRawPayload(RootModel[dict[str, JsonValue]]):
@@ -326,7 +330,9 @@ class HumanInputPlatformContactWorkspaceEntry(DefaultFieldsDCMixin, TypeBase):
 
     tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False, comment="Logical foreign key to tenants.id.")
     contact_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical foreign key to human_input_contact_identities.id."
+        StringUUID,
+        nullable=False,
+        comment="Logical foreign key to human_input_contact_identities.id.",
     )
     added_by_account_id: Mapped[str] = mapped_column(
         StringUUID,
@@ -335,10 +341,18 @@ class HumanInputPlatformContactWorkspaceEntry(DefaultFieldsDCMixin, TypeBase):
     )
 
 
-class _IMMessageInboxDefaultFieldsMixin(MappedAsDataclass):
-    """Database identity and creation time for one callback record."""
+class IMMessageEvent(TypeBase):
+    """Authenticated callback facts and successful processing time."""
 
-    __abstract__ = True
+    __tablename__ = "im_message_event"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "provider",
+            "event_id",
+            name="im_message_event_provider_event_uq",
+        ),
+        {"comment": "Durable authenticated IM callback records."},
+    )
 
     id: Mapped[str] = mapped_column(
         StringUUID,
@@ -356,37 +370,25 @@ class _IMMessageInboxDefaultFieldsMixin(MappedAsDataclass):
         server_default=sa.func.current_timestamp(),
     )
 
-
-class IMMessageInbox(_IMMessageInboxDefaultFieldsMixin, TypeBase):
-    """Authenticated callback facts and successful processing time."""
-
-    __tablename__ = "im_message_inbox"
-    __table_args__ = (
-        sa.UniqueConstraint(
-            "provider",
-            "provider_tenant_id",
-            "provider_event_id",
-            name="im_message_inbox_provider_event_uq",
-        ),
-        {"comment": "Durable authenticated IM callback records."},
-    )
-
-    integration_id: Mapped[str] = mapped_column(
+    channel_id: Mapped[str] = mapped_column(
         StringUUID,
         nullable=False,
         kw_only=True,
-        comment="Logical local Integration routing identifier without physical ownership.",
+        comment="Logical local Channel routing identifier without physical ownership.",
     )
     provider: Mapped[_IMProvider] = mapped_column(
-        EnumText(_IMProvider), nullable=False, kw_only=True, comment="Authenticated Provider discriminator."
+        EnumText(_IMProvider),
+        nullable=False,
+        kw_only=True,
+        comment="Authenticated Provider discriminator.",
     )
-    provider_tenant_id: Mapped[str] = mapped_column(
+    tenant_id: Mapped[str] = mapped_column(
         sa.String(IM_INBOX_PROVIDER_METADATA_MAX_LENGTH),
         nullable=False,
         kw_only=True,
         comment="Stable authenticated Provider tenant identifier.",
     )
-    provider_event_id: Mapped[str | None] = mapped_column(
+    event_id: Mapped[str | None] = mapped_column(
         sa.String(IM_INBOX_PROVIDER_METADATA_MAX_LENGTH),
         nullable=True,
         default=None,
@@ -394,10 +396,17 @@ class IMMessageInbox(_IMMessageInboxDefaultFieldsMixin, TypeBase):
         comment="Real Provider event ID when supplied.",
     )
     provider_event_time: Mapped[datetime | None] = mapped_column(
-        sa.DateTime, nullable=True, default=None, kw_only=True, comment="Provider event timestamp when supplied."
+        sa.DateTime,
+        nullable=True,
+        default=None,
+        kw_only=True,
+        comment="Provider event timestamp when supplied.",
     )
     received_at: Mapped[datetime] = mapped_column(
-        sa.DateTime, nullable=False, kw_only=True, comment="Dify receive timestamp for this delivery."
+        sa.DateTime,
+        nullable=False,
+        kw_only=True,
+        comment="Dify receive timestamp for this delivery.",
     )
     provider_event_type: Mapped[str | None] = mapped_column(
         sa.String(IM_INBOX_PROVIDER_METADATA_MAX_LENGTH),
@@ -413,7 +422,17 @@ class IMMessageInbox(_IMMessageInboxDefaultFieldsMixin, TypeBase):
         comment="Ingress contract used to construct the Provider payload snapshot.",
     )
     payload: Mapped[str] = mapped_column(
-        LongText, nullable=False, kw_only=True, comment="Authenticated Provider-native payload."
+        LongText,
+        nullable=False,
+        kw_only=True,
+        comment="Authenticated Provider-native payload.",
+    )
+    request_ip_address: Mapped[str | None] = mapped_column(
+        sa.Text,
+        nullable=True,
+        default=None,
+        kw_only=True,
+        comment="HTTP request IP when available; absent for stream and historical events.",
     )
     processed_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime,
@@ -427,6 +446,8 @@ class IMMessageInbox(_IMMessageInboxDefaultFieldsMixin, TypeBase):
 class HumanInputEmailProvider(DefaultFieldsDCMixin, TypeBase):
     """Single workspace-level email provider used for Human Input delivery."""
 
+    # TODO(QuantumGhost): Rename this model and table to HumanInputEmailChannel.
+
     __tablename__ = "human_input_email_providers"
     __table_args__ = (
         sa.UniqueConstraint("tenant_id", name="human_input_email_providers_tenant_uq"),
@@ -434,15 +455,17 @@ class HumanInputEmailProvider(DefaultFieldsDCMixin, TypeBase):
     )
 
     provider: Mapped[_EmailProviderType] = mapped_column(
-        EnumText(_EmailProviderType), nullable=False, comment="Configured email provider discriminator."
+        EnumText(_EmailProviderType),
+        nullable=False,
+        comment="Configured email provider discriminator.",
     )
     sender_email: Mapped[str] = mapped_column(
         sa.String(320), nullable=False, comment="Configured sender email address."
     )
-    encrypted_credentials: Mapped[ResendEmailProviderEncryptedCredentials] = mapped_column(
-        FrozenPydanticModelColumn(ResendEmailProviderEncryptedCredentials),
+    encrypted_credentials: Mapped[_ChannelEncryptedCredentials] = mapped_column(
+        FrozenPydanticModelColumn(_ChannelEncryptedCredentials),
         nullable=False,
-        comment="Encrypted Resend credential Pydantic model stored as JSON.",
+        comment="Encrypted complete Channel credentials stored as JSON.",
     )
     tenant_id: Mapped[str] = mapped_column(
         StringUUID,
@@ -456,7 +479,10 @@ class HumanInputEmailProvider(DefaultFieldsDCMixin, TypeBase):
         comment="Monotonic Email configuration revision used for compare-and-swap.",
     )
     sender_name: Mapped[str] = mapped_column(
-        sa.String(255), nullable=False, default="", comment="Optional sender display name."
+        sa.String(255),
+        nullable=False,
+        default="",
+        comment="Optional sender display name.",
     )
     configured_by_account_id: Mapped[str | None] = mapped_column(
         StringUUID,
@@ -511,8 +537,8 @@ class HumanInputIMChannel(DefaultFieldsDCMixin, TypeBase):
         nullable=False,
         comment="Confirmed provider-side organization, tenant, or workspace identifier.",
     )
-    encrypted_credentials: Mapped[IMEncryptedCredentials] = mapped_column(
-        FrozenPydanticModelColumn(IMEncryptedCredentials),
+    encrypted_credentials: Mapped[_ChannelEncryptedCredentials] = mapped_column(
+        FrozenPydanticModelColumn(_ChannelEncryptedCredentials),
         nullable=False,
         comment="Versioned opaque encrypted IM Channel credential envelope.",
     )
@@ -571,6 +597,7 @@ class HumanInputIMIdentity(DefaultFieldsDCMixin, TypeBase):
             "length(trim(provider_user_id)) > 0",
             name="human_input_im_identities_provider_user_nonblank",
         ),
+        sa.Index("hiimi_channel_id_idx", "channel_id", "id"),
         sa.Index("hiimi_channel_email_idx", "channel_id", "normalized_email"),
         sa.Index("hiimi_channel_name_idx", "channel_id", "normalized_name"),
         {
@@ -607,19 +634,34 @@ class HumanInputIMIdentity(DefaultFieldsDCMixin, TypeBase):
         comment="Timestamp of the latest successful Provider observation.",
     )
     display_name: Mapped[str | None] = mapped_column(
-        sa.String(255), nullable=True, default=None, comment="Latest canonical non-blank Provider display name."
+        sa.String(255),
+        nullable=True,
+        default=None,
+        comment="Latest canonical non-blank Provider display name.",
     )
     normalized_name: Mapped[str | None] = mapped_column(
-        sa.String(255), nullable=True, default=None, comment="Canonical display name used by persistence queries."
+        sa.String(255),
+        nullable=True,
+        default=None,
+        comment="Canonical display name used by persistence queries.",
     )
     email: Mapped[str | None] = mapped_column(
-        sa.String(320), nullable=True, default=None, comment="Latest canonical non-blank Provider email."
+        sa.String(320),
+        nullable=True,
+        default=None,
+        comment="Latest canonical non-blank Provider email.",
     )
     normalized_email: Mapped[str | None] = mapped_column(
         sa.String(320),
         nullable=True,
         default=None,
         comment="Canonical email used by matching and persistence queries.",
+    )
+    avatar_file_id: Mapped[str | None] = mapped_column(
+        StringUUID,
+        nullable=True,
+        default=None,
+        comment="Logical upload_files.id reference for the current IM avatar.",
     )
 
 
@@ -647,10 +689,14 @@ class HumanInputIMBinding(DefaultFieldsDCMixin, TypeBase):
         comment="Logical human_input_im_channels.id reference.",
     )
     contact_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical human_input_contact_identities.id reference."
+        StringUUID,
+        nullable=False,
+        comment="Logical human_input_contact_identities.id reference.",
     )
     im_identity_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical human_input_im_identities.id reference."
+        StringUUID,
+        nullable=False,
+        comment="Logical human_input_im_identities.id reference.",
     )
     bound_by_account_id: Mapped[str | None] = mapped_column(
         StringUUID,
@@ -713,47 +759,71 @@ class HumanInputIMSyncRun(DefaultFieldsDCMixin, TypeBase):
     """One manually triggered organization IM directory synchronization.
 
     Preventing parallel queued or running rows is a service transaction invariant:
-    lock the owning integration row before creating a run. A portable partial
+    lock the owning channel row before creating a run. A portable partial
     unique index is deliberately not used. A worker may apply current identities
-    and bindings only while ``integration_config_version`` still matches the
-    owning integration.
+    and bindings only while ``channel_config_version`` still matches the
+    owning channel.
     """
 
     __tablename__ = "human_input_im_sync_runs"
     __table_args__ = (
-        sa.CheckConstraint("integration_config_version > 0", name="captured_version_positive"),
+        sa.CheckConstraint("channel_config_version > 0", name="captured_version_positive"),
+        sa.CheckConstraint(
+            "(started_by_account_id IS NOT NULL AND started_by_sys_user_id IS NULL) OR "
+            "(started_by_account_id IS NULL AND started_by_sys_user_id IS NOT NULL)",
+            name="initiator_exclusive",
+        ),
         sa.CheckConstraint(
             "added_count >= 0 AND not_matched_count >= 0 AND failed_count >= 0 AND removed_count >= 0 "
             "AND skipped_count >= 0",
             name="result_counts_nonnegative",
         ),
-        sa.Index("hiimsr_integration_created_idx", "integration_id", "created_at", "id"),
-        sa.Index("hiimsr_integration_status_created_idx", "integration_id", "status", "created_at"),
+        sa.Index("hiimsr_channel_created_idx", "channel_id", "created_at", "id"),
+        sa.Index(
+            "hiimsr_channel_status_created_idx",
+            "channel_id",
+            "status",
+            "created_at",
+        ),
         {"comment": "Manual IM directory synchronization lifecycle and aggregate counts."},
     )
-    # TODO(QuantumGhost): Rename this field
-    integration_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical foreign key to human_input_im_integrations.id."
+    channel_id: Mapped[str] = mapped_column(
+        StringUUID,
+        nullable=False,
+        comment="Logical foreign key to human_input_im_channels.id.",
     )
-    integration_config_version: Mapped[int] = mapped_column(
+    channel_config_version: Mapped[int] = mapped_column(
         sa.Integer,
         nullable=False,
-        comment="Integration configuration revision captured when this synchronization was created.",
+        comment="Channel configuration revision captured when this synchronization was created.",
     )
     provider: Mapped[_IMProvider] = mapped_column(
-        EnumText(_IMProvider), nullable=False, comment="Provider snapshot used by this synchronization."
+        EnumText(_IMProvider),
+        nullable=False,
+        comment="Provider snapshot used by this synchronization.",
     )
     status: Mapped[_IMSyncRunStatus] = mapped_column(
-        EnumText(_IMSyncRunStatus), nullable=False, comment="Current synchronization lifecycle state."
+        EnumText(_IMSyncRunStatus),
+        nullable=False,
+        comment="Current synchronization lifecycle state.",
     )
     added_count: Mapped[int] = mapped_column(
-        sa.Integer, nullable=False, default=0, comment="Number of entries newly matched and bound."
+        sa.Integer,
+        nullable=False,
+        default=0,
+        comment="Number of entries newly matched and bound.",
     )
     not_matched_count: Mapped[int] = mapped_column(
-        sa.Integer, nullable=False, default=0, comment="Number of entries requiring later manual handling."
+        sa.Integer,
+        nullable=False,
+        default=0,
+        comment="Number of entries requiring later manual handling.",
     )
     failed_count: Mapped[int] = mapped_column(
-        sa.Integer, nullable=False, default=0, comment="Number of entries that failed reconciliation."
+        sa.Integer,
+        nullable=False,
+        default=0,
+        comment="Number of entries that failed reconciliation.",
     )
     removed_count: Mapped[int] = mapped_column(
         sa.Integer,
@@ -762,25 +832,46 @@ class HumanInputIMSyncRun(DefaultFieldsDCMixin, TypeBase):
         comment="Number of removed binding facts, including one unbound-identity fact when applicable.",
     )
     skipped_count: Mapped[int] = mapped_column(
-        sa.Integer, nullable=False, default=0, comment="Number of entries intentionally skipped."
+        sa.Integer,
+        nullable=False,
+        default=0,
+        comment="Number of entries intentionally skipped.",
     )
     started_by_account_id: Mapped[str | None] = mapped_column(
         StringUUID,
         nullable=True,
         default=None,
-        comment="Logical foreign key to accounts.id for the administrator who started this run.",
+        comment="Logical accounts.id reference for CE/SaaS initiators; null only for EE sys_user initiators.",
+    )
+    started_by_sys_user_id: Mapped[str | None] = mapped_column(
+        StringUUID,
+        nullable=True,
+        default=None,
+        comment="Logical reference to upstream EE sys_users.id; mutually exclusive with started_by_account_id.",
     )
     started_at: Mapped[datetime | None] = mapped_column(
-        sa.DateTime, nullable=True, default=None, comment="Timestamp when a worker started processing the run."
+        sa.DateTime,
+        nullable=True,
+        default=None,
+        comment="Timestamp when a worker started processing the run.",
     )
     finished_at: Mapped[datetime | None] = mapped_column(
-        sa.DateTime, nullable=True, default=None, comment="Terminal completion timestamp."
+        sa.DateTime,
+        nullable=True,
+        default=None,
+        comment="Terminal completion timestamp.",
     )
     error_code: Mapped[str | None] = mapped_column(
-        sa.String(100), nullable=True, default=None, comment="Machine-readable terminal failure code."
+        sa.String(100),
+        nullable=True,
+        default=None,
+        comment="Machine-readable terminal failure code.",
     )
     error_message: Mapped[str | None] = mapped_column(
-        LongText, nullable=True, default=None, comment="Operator-safe terminal failure summary."
+        LongText,
+        nullable=True,
+        default=None,
+        comment="Operator-safe terminal failure summary.",
     )
 
     results: Mapped[list[HumanInputIMSyncResult]] = relationship(
@@ -807,25 +898,45 @@ class HumanInputIMSyncResult(DefaultFieldsDCMixin, TypeBase):
             "operation_key",
             name="human_input_im_sync_results_run_operation_uq",
         ),
-        sa.Index("hiimsres_run_type_created_idx", "sync_run_id", "result_type", "created_at", "id"),
-        sa.Index("hiimsres_integration_contact_created_idx", "integration_id", "contact_id", "created_at"),
-        sa.Index("hiimsres_integration_identity_created_idx", "integration_id", "im_identity_id", "created_at"),
+        sa.Index(
+            "hiimsres_run_type_created_idx",
+            "sync_run_id",
+            "result_type",
+            "created_at",
+            "id",
+        ),
+        sa.Index(
+            "hiimsres_channel_contact_created_idx",
+            "channel_id",
+            "contact_id",
+            "created_at",
+        ),
+        sa.Index(
+            "hiimsres_channel_identity_created_idx",
+            "channel_id",
+            "im_identity_id",
+            "created_at",
+        ),
         {"comment": "Append-only per-entry, removed-binding, and diagnostic IM synchronization outcomes."},
     )
 
-    integration_id: Mapped[str] = mapped_column(
+    channel_id: Mapped[str] = mapped_column(
         StringUUID,
         nullable=False,
         comment=(
-            "Denormalized logical foreign key to human_input_im_integrations.id; "
-            "must match the integration referenced by sync_run_id."
+            "Denormalized logical foreign key to human_input_im_channels.id; "
+            "must match the channel referenced by sync_run_id."
         ),
     )
     sync_run_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical foreign key to human_input_im_sync_runs.id."
+        StringUUID,
+        nullable=False,
+        comment="Logical foreign key to human_input_im_sync_runs.id.",
     )
     result_type: Mapped[_IMSyncResultType] = mapped_column(
-        EnumText(_IMSyncResultType), nullable=False, comment="Stable result bucket used by pagination."
+        EnumText(_IMSyncResultType),
+        nullable=False,
+        comment="Stable result bucket used by pagination.",
     )
     operation_key: Mapped[str | None] = mapped_column(
         sa.String(255),
@@ -840,13 +951,22 @@ class HumanInputIMSyncResult(DefaultFieldsDCMixin, TypeBase):
         comment="External provider user identifier observed for this result; not a logical foreign key.",
     )
     display_name: Mapped[str | None] = mapped_column(
-        sa.String(255), nullable=True, default=None, comment="Provider display name observed for this result."
+        sa.String(255),
+        nullable=True,
+        default=None,
+        comment="Provider display name observed for this result.",
     )
     email: Mapped[str | None] = mapped_column(
-        sa.String(320), nullable=True, default=None, comment="Provider email observed for this result."
+        sa.String(320),
+        nullable=True,
+        default=None,
+        comment="Provider email observed for this result.",
     )
     normalized_email: Mapped[str | None] = mapped_column(
-        sa.String(320), nullable=True, default=None, comment="Lower-cased provider email used during matching."
+        sa.String(320),
+        nullable=True,
+        default=None,
+        comment="Lower-cased provider email used during matching.",
     )
     contact_id: Mapped[str | None] = mapped_column(
         StringUUID,
@@ -877,10 +997,16 @@ class HumanInputIMSyncResult(DefaultFieldsDCMixin, TypeBase):
         comment="Stable removal reason for removed results only.",
     )
     reason_code: Mapped[str | None] = mapped_column(
-        sa.String(100), nullable=True, default=None, comment="Machine-readable failure, skip, or mismatch reason."
+        sa.String(100),
+        nullable=True,
+        default=None,
+        comment="Machine-readable failure, skip, or mismatch reason.",
     )
     reason_message: Mapped[str | None] = mapped_column(
-        LongText, nullable=True, default=None, comment="Operator-safe detail for diagnostics."
+        LongText,
+        nullable=True,
+        default=None,
+        comment="Operator-safe detail for diagnostics.",
     )
     directory_entry_payload: Mapped[IMSyncDirectoryEntryPayload | None] = mapped_column(
         FrozenPydanticModelColumn(IMSyncDirectoryEntryPayload),
@@ -950,19 +1076,31 @@ class HumanInputIMReconciliationChange(DefaultFieldsDCMixin, TypeBase):
             "(subject_kind = 'binding' AND im_binding_id IS NOT NULL)",
             name="subject_identifier_shape",
         ),
-        sa.Index("hiimrc_run_subject_committed_idx", "sync_run_id", "subject_kind", "committed_at", "id"),
-        sa.Index("hiimrc_integration_committed_idx", "integration_id", "committed_at", "id"),
+        sa.Index(
+            "hiimrc_run_subject_committed_idx",
+            "sync_run_id",
+            "subject_kind",
+            "committed_at",
+            "id",
+        ),
+        sa.Index("hiimrc_channel_committed_idx", "channel_id", "committed_at", "id"),
         {"comment": "Append-only IM identity and IM binding reconciliation mutation history."},
     )
 
-    integration_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical foreign key to human_input_im_integrations.id."
+    channel_id: Mapped[str] = mapped_column(
+        StringUUID,
+        nullable=False,
+        comment="Logical foreign key to human_input_im_channels.id.",
     )
     sync_run_id: Mapped[str] = mapped_column(
-        StringUUID, nullable=False, comment="Logical foreign key to human_input_im_sync_runs.id."
+        StringUUID,
+        nullable=False,
+        comment="Logical foreign key to human_input_im_sync_runs.id.",
     )
     operation_key: Mapped[str] = mapped_column(
-        sa.String(255), nullable=False, comment="Deterministic run-local idempotency key."
+        sa.String(255),
+        nullable=False,
+        comment="Deterministic run-local idempotency key.",
     )
     subject_kind: Mapped[_IMReconciliationSubjectKind] = mapped_column(
         EnumText(_IMReconciliationSubjectKind), nullable=False
@@ -976,7 +1114,10 @@ class HumanInputIMReconciliationChange(DefaultFieldsDCMixin, TypeBase):
     before_snapshot: Mapped[IMReconciliationChangeSnapshot | None] = mapped_column(
         FrozenPydanticModelColumn(
             _IM_RECONCILIATION_SNAPSHOT_ADAPTER,
-            model_types=(IMIdentityReconciliationSnapshot, IMBindingReconciliationSnapshot),
+            model_types=(
+                IMIdentityReconciliationSnapshot,
+                IMBindingReconciliationSnapshot,
+            ),
         ),
         nullable=True,
         default=None,
@@ -984,10 +1125,268 @@ class HumanInputIMReconciliationChange(DefaultFieldsDCMixin, TypeBase):
     after_snapshot: Mapped[IMReconciliationChangeSnapshot | None] = mapped_column(
         FrozenPydanticModelColumn(
             _IM_RECONCILIATION_SNAPSHOT_ADAPTER,
-            model_types=(IMIdentityReconciliationSnapshot, IMBindingReconciliationSnapshot),
+            model_types=(
+                IMIdentityReconciliationSnapshot,
+                IMBindingReconciliationSnapshot,
+            ),
         ),
         nullable=True,
         default=None,
+    )
+
+
+class HumanInputForm(DefaultFieldsDCMixin, TypeBase):
+    __tablename__ = "hitlv2_forms"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "workflow_run_id",
+            "node_execution_id",
+            name="hitlv2_forms_execution_uq",
+        ),
+        sa.Index("hitlv2_forms_run_id_idx", "workflow_run_id", "id"),
+        # Equality predicates precede the ID cursor used by expiration scans.
+        sa.Index("hitlv2_forms_expiration_scan_idx", "tenant_id", "app_id", "form_kind", "status", "id"),
+        sa.Index("hitlv2_forms_node_deadline_idx", "form_kind", "status", "expiration_time", "id"),
+        sa.Index("hitlv2_forms_global_deadline_idx", "form_kind", "status", "global_timeout_deadline", "id"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    app_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    workflow_run_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    # correspond to WorkflowNodeExecutionModel.id
+    node_execution_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    form_kind: Mapped[HumanInputFormKind] = mapped_column(
+        EnumText(HumanInputFormKind),
+        nullable=False,
+        default=HumanInputFormKind.RUNTIME,
+        kw_only=True,
+    )
+    status: Mapped[HumanInputFormStatus] = mapped_column(
+        EnumText(HumanInputFormStatus),
+        nullable=False,
+        default=HumanInputFormStatus.WAITING,
+        server_default=HumanInputFormStatus.WAITING.value,
+        kw_only=True,
+        comment="Persisted form outcome; terminal states are not recomputed from deadlines.",
+    )
+    # Form level expiration time.
+    expiration_time: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+    )
+    # global timeout deadline for this form / workflow execution.
+    global_timeout_deadline: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+    )
+    # The form definition after resolving all runtime related variables.
+    resolved_form: Mapped[ResolvedForm] = mapped_column(FrozenPydanticModelColumn(ResolvedForm), nullable=False)
+
+    # The following fields are not `None` once the form has been submitted.
+    submitted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True)
+    submitted_by_recipient_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    submitted_by_delivery_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None, kw_only=True)
+    # submission_data
+    selected_action_id: Mapped[str | None] = mapped_column(sa.String(200), nullable=True)
+    # original submission inputs data without any transformation or sanitization.
+    raw_submission_inputs: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # validated and sanitized submission data, a mapping from submitted form data to
+    # variable segments.
+    #
+    # For special reference types such as File / FileSegment, the File ownership has been
+    # validated.
+    normalized_submission_data: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+
+
+class RecipientSubjectType(StrEnum):
+    CONTACT = "contact"
+    EMAIL = "email"
+    END_USER = "end_user"
+
+
+class RecipientSources(RootModel[Sequence[RecipientConfig]]):
+    model_config = ConfigDict(frozen=True, strict=True, validate_default=True)
+
+
+class RecipientSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, validate_default=True)
+    # The name of the recipeint when the recipient is created.
+    #
+    # For recipeint without a name (Dyanmic Email / Onetime Email / EndUser), this
+    # Field is set to `None`.
+    name: str | None = None
+
+
+class HumanInputRecipient(DefaultFieldsDCMixin, TypeBase):
+    __tablename__ = "hitlv2_recipients"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "form_id",
+            "subject_type",
+            "subject_value",
+            name="hitlv2_recipients_subject_uq",
+        ),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    form_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+
+    subject_type: Mapped[RecipientSubjectType] = mapped_column(
+        EnumText(RecipientSubjectType),
+        nullable=False,
+    )
+    # The interpretation of identity_value depends on `subject_value`:
+    #
+    # - For RecipientSubjectType.CONTACT, this field stores the value of HumanInputContactIdentity.id
+    # - For RecipientSubjectType.END_USER, this field stores the value of EndUser.id
+    # - For RecipientSubjectType.EMAIL, this field stores the normalized email of the recipient.
+    subject_value: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    sources: Mapped[RecipientSources] = mapped_column(
+        FrozenPydanticModelColumn(RecipientSources),
+        nullable=False,
+    )
+    snapshot: Mapped[RecipientSnapshot] = mapped_column(
+        FrozenPydanticModelColumn(RecipientSnapshot),
+        nullable=False,
+    )
+
+
+class DeliveryType(StrEnum):
+    IM_CARD = "im_card"
+    COSNOLE_WEB = "console_web"
+    STANDALONE_WEB = "standalone_web"
+
+
+_TARGET_SNAPSHOT_ADAPTER: TypeAdapter[TargetSnapshot] = TypeAdapter(TargetSnapshot)
+
+
+class HumanInputDelivery(DefaultFieldsDCMixin, TypeBase):
+    __tablename__ = "hitlv2_deliveries"
+    __table_args__ = (
+        sa.Index("hitlv2_deliveries_token_idx", "token_hash"),
+        sa.Index("hitlv2_deliveries_form_id_idx", "form_id", "id"),
+        sa.Index("hitlv2_deliveries_form_target_idx", "form_id", "target_type"),
+    )
+
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    form_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+
+    token_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+
+    recipient_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    auth_type: Mapped[SubmissionAuthType] = mapped_column(
+        EnumText(SubmissionAuthType),
+        nullable=False,
+    )
+    target_type: Mapped[DeliveryTargetType] = mapped_column(EnumText(DeliveryTargetType), nullable=False)
+    target_snapshot: Mapped[TargetSnapshot] = mapped_column(
+        FrozenPydanticModelColumn(
+            _TARGET_SNAPSHOT_ADAPTER,
+            model_types=(IMUserTargetSnapshot, EmailTargetSnapshot, InitiatorSnapshot),
+        ),
+        nullable=False,
+    )
+
+
+class DeliveryResponse(RootModel[dict[str, JsonValue]]):
+    model_config = ConfigDict(frozen=True, strict=True, validate_default=True)
+
+
+class HumanInputDeliveryAttempt(DefaultFieldsDCMixin, TypeBase):
+    __tablename__ = "hitlv2_delivery_attempts"
+
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    form_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+
+    delivery_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    status: Mapped[DeliveryStatus] = mapped_column(EnumText(DeliveryStatus), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(sa.String(200), nullable=True)
+    response: Mapped[DeliveryResponse] = mapped_column(FrozenPydanticModelColumn(DeliveryResponse), nullable=False)
+
+
+class AuditEventType(StrEnum):
+    # The form is opened and viewed.
+    FORM_VIEW = "form_view"
+    # An Email OTP send operation
+    OTP_SEND = "otp_send"
+    # An Email OTP verification
+    OTP_VERIFICATION = "otp_verification"
+    # This seems to break the IM abstration???
+    IM_CALLBACK_VERIFICATION = "im_callback_verification"
+    #
+    FORM_SUBMISSION = "form_submission"
+
+
+class FormViewEvent(_ImmutableJSONModel):
+    type: Literal[AuditEventType.FORM_VIEW] = AuditEventType.FORM_VIEW
+    # None means the request IP was unavailable.
+    viewer_ip_address: str | None
+
+
+class OtpSendEvent(_ImmutableJSONModel):
+    type: Literal[AuditEventType.OTP_SEND] = AuditEventType.OTP_SEND
+
+    recipient_id: str
+    recipient_email: str
+    sender_ip_address: str | None
+
+
+class OtpVerificationEvent(_ImmutableJSONModel):
+    type: Literal[AuditEventType.OTP_VERIFICATION] = AuditEventType.OTP_VERIFICATION
+
+    recipient_id: str
+    recipient_email: str
+    succeeded: bool
+    submitter_ip_address: str | None
+    reason: str  # wrong verification code or wrong ticket.
+
+
+class IMCallbackVerificationEvent(_ImmutableJSONModel):
+    # We might need to break the abstration.
+    type: Literal[AuditEventType.IM_CALLBACK_VERIFICATION] = AuditEventType.IM_CALLBACK_VERIFICATION
+
+    succeeded: bool
+    request_ip_address: str | None
+    reason: str  # fail reasons
+
+
+class ServiceAPIFormSubmissionEvent(_ImmutableJSONModel):
+    """Distinguish the approving recipient grant from the Service API caller."""
+
+    # TODO(QuantumGhost): we need to check what other information needed to be stored
+    # in the audit event later.
+
+    type: Literal[AuditEventType.FORM_SUBMISSION] = AuditEventType.FORM_SUBMISSION
+    recipient_id: str
+    end_user_id: str
+
+
+type AuditEvent = Annotated[
+    FormViewEvent | OtpSendEvent | OtpVerificationEvent | IMCallbackVerificationEvent | ServiceAPIFormSubmissionEvent,
+    Field(discriminator="type"),
+]
+
+AUDIT_EVENT_ADAPTER: TypeAdapter[AuditEvent] = TypeAdapter(AuditEvent)
+
+
+class HumanInputAuditEvent(DefaultFieldsDCMixin, TypeBase):
+    __tablename__ = "hitlv2_audit_events"
+
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    form_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+
+    payload: Mapped[AuditEvent] = mapped_column(
+        FrozenPydanticModelColumn(
+            AUDIT_EVENT_ADAPTER,
+            model_types=(
+                FormViewEvent,
+                OtpSendEvent,
+                OtpVerificationEvent,
+                IMCallbackVerificationEvent,
+                ServiceAPIFormSubmissionEvent,
+            ),
+        ),
+        nullable=False,
     )
 
 
@@ -1005,13 +1404,11 @@ __all__ = [
     "HumanInputIMSyncRun",
     "HumanInputPlatformContactWorkspaceEntry",
     "IMBindingReconciliationSnapshot",
-    "IMEncryptedCredentials",
     "IMIdentityRawPayload",
     "IMIdentityReconciliationSnapshot",
-    "IMMessageInbox",
+    "IMMessageEvent",
     "IMReconciliationChangeSnapshot",
     "IMSyncContactSnapshot",
     "IMSyncDirectoryEntryPayload",
     "IMSyncIdentitySnapshot",
-    "ResendEmailProviderEncryptedCredentials",
 ]

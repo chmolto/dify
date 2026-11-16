@@ -9,7 +9,7 @@ from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import override
+from typing import ClassVar, override
 from urllib.parse import parse_qs, urlencode
 
 import pytest
@@ -43,6 +43,7 @@ from core.human_input_v2.im_integration.adapters import (
     WebhookRequest,
 )
 from core.human_input_v2.im_integration.adapters import slack as slack_adapter_module
+from core.human_input_v2.im_integration.adapters.entities import IMProviderError
 from core.human_input_v2.im_integration.adapters.slack import SlackIMProviderAdapter
 from core.human_input_v2.resolved_form import (
     FileInput,
@@ -156,11 +157,11 @@ class _SlackApiServer:
 
 
 @pytest.fixture
-def slack_api_server() -> Generator[_SlackApiServer, None, None]:
+def slack_api_server() -> Generator[_SlackApiServer]:
     state = _SlackApiState()
     server = _SlackApiHTTPServer(("127.0.0.1", 0), _SlackApiHandler)
     server.state = state
-    thread = threading.Thread(target=server.serve_forever)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     try:
         yield _SlackApiServer(server, state)
@@ -176,7 +177,8 @@ class _RecordingConsumer:
         self.acceptance = acceptance
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self.events.append(event)
         return self.acceptance
 
@@ -352,8 +354,85 @@ def test_real_web_client_round_trips_credentials_directory_messages_and_cards(
     assert update_parameters["channel"] == "sanitized-channel"
     assert update_parameters["ts"] == "1000.000002"
     assert update_parameters["text"] == "Sanitized static content"
-    assert update_parameters["blocks"] == []
+    assert update_parameters["blocks"] == [{"type": "markdown", "text": "Sanitized static content"}]
     assert "markdown_text" not in update_parameters
+
+
+@pytest.mark.parametrize(
+    ("subject", "heading"),
+    [
+        ("### HITL v2 Migration Check", r"# \#\#\# HITL v2 Migration Check"),
+        ("**Review** _Alice_", r"# \*\*Review\*\* \_Alice\_"),
+        ("[Review](https://example.com)", r"# \[Review\]\(https\:\/\/example\.com\)"),
+    ],
+)
+def test_real_web_client_sends_plain_subject_separately_from_markdown_body(
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api_server: _SlackApiServer,
+    subject: str,
+    heading: str,
+) -> None:
+    slack_api_server.state.enqueue("chat.postMessage", {"ok": True, "channel": "D0123456789", "ts": "1000.000001"})
+    adapter, _ = _adapter(monkeypatch, slack_api_server)
+    body = "# H1\n\n## H2\n\n[Approval](https://example.com/human-input-test)"
+
+    result = adapter.messaging.send_text(ProviderUserId("sanitized-user"), body, subject=subject)
+
+    assert isinstance(result, MessageAccepted)
+    requests = slack_api_server.state.requests_for("chat.postMessage")
+    assert len(requests) == 1
+    parameters = requests[0].parameters()
+    assert parameters["channel"] == "sanitized-user"
+    assert parameters["blocks"] == [
+        {"type": "markdown", "text": heading},
+        {"type": "markdown", "text": body},
+    ]
+    assert parameters["text"] == f"{subject}\n\n{body}"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_blocks"),
+    [
+        (
+            "# Hello\n\n**Name**\nAccepted\n\n[Details](https://example.com)\n\nSubmitted: approve",
+            [
+                {
+                    "type": "markdown",
+                    "text": "# Hello\n\n**Name**\nAccepted\n\n[Details](https://example.com)\n\nSubmitted: approve",
+                }
+            ],
+        ),
+        ("x" * 12_000, [{"type": "markdown", "text": "x" * 12_000}]),
+        ("x" * 12_001, []),
+    ],
+    ids=("commonmark", "markdown-limit", "oversized-text-fallback"),
+)
+def test_real_web_client_static_replacement_preserves_content_without_interactive_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api_server: _SlackApiServer,
+    content: str,
+    expected_blocks: list[dict[str, str]],
+) -> None:
+    state = slack_api_server.state
+    state.enqueue("chat.postMessage", {"ok": True, "channel": "D0123456789", "ts": "1712345678.123456"})
+    state.enqueue("chat.update", {"ok": True})
+    adapter, _ = _adapter(monkeypatch, slack_api_server)
+    accepted = adapter.dynamic_card_messaging.send_card(
+        ProviderUserId("U0123456789"),
+        _intent(),
+        CorrelationToken("sanitized-correlation"),
+    )
+    assert isinstance(accepted, MessageAccepted)
+    replacement = adapter.dynamic_card_messaging.replace_with_static(accepted.locator, StaticCardIntent(content))
+
+    assert replacement is None
+    updates = state.requests_for("chat.update")
+    assert len(updates) == 1
+    parameters = updates[0].parameters()
+    assert parameters["channel"] == "D0123456789"
+    assert parameters["ts"] == "1712345678.123456"
+    assert parameters["text"] == content
+    assert parameters["blocks"] == expected_blocks
 
 
 def test_real_web_client_reuses_card_reference_across_in_process_adapter_instances(
@@ -420,6 +499,28 @@ def test_real_adapter_rejects_text_reference_without_update(
     assert len(state.requests_for("chat.update")) == 1
 
 
+def test_repeated_credential_tests_reject_a_previously_valid_token(
+    monkeypatch: pytest.MonkeyPatch,
+    slack_api_server: _SlackApiServer,
+) -> None:
+    state = slack_api_server.state
+    state.enqueue(
+        "auth.test",
+        {"ok": True, "team_id": "sanitized-team"},
+        headers=(("X-OAuth-Scopes", "chat:write,users:read,users:read.email"),),
+    )
+    state.enqueue("apps.connections.open", {"ok": True, "url": "wss://sanitized.invalid/socket"})
+    state.enqueue("auth.test", {"ok": False, "error": "token_revoked"})
+    adapter, _ = _adapter(monkeypatch, slack_api_server)
+
+    assert adapter.test_credentials() == CredentialTestSuccess(IMProvider.SLACK, "sanitized-team")
+    rejected = adapter.test_credentials()
+
+    assert isinstance(rejected, CredentialTestFailure)
+    assert rejected.kind is CredentialTestFailureKind.AUTHENTICATION_REJECTED
+    assert rejected.provider_error_code == "token_revoked"
+
+
 @pytest.mark.parametrize(
     ("auth_body", "auth_headers", "expected_kind"),
     [
@@ -447,6 +548,16 @@ def test_real_web_client_credential_failures_are_typed_and_sanitized(
     slack_api_server.state.enqueue("auth.test", auth_body, headers=auth_headers)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
 
+    if expected_kind is CredentialTestFailureKind.TENANT_ID_UNAVAILABLE:
+        with pytest.raises(IMProviderError):
+            adapter.test_credentials()
+        return
+    if auth_body.get("ok") is True:
+        if not auth_headers:
+            with pytest.raises(IMProviderError):
+                adapter.test_credentials()
+            return
+        expected_kind = CredentialTestFailureKind.PERMISSION_DENIED
     result = adapter.test_credentials()
 
     assert isinstance(result, CredentialTestFailure)
@@ -477,6 +588,10 @@ def test_real_web_client_socket_credential_failures_are_typed(
     slack_api_server.state.enqueue("apps.connections.open", connection_body)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
 
+    if connection_body.get("ok") is True:
+        with pytest.raises(IMProviderError):
+            adapter.test_credentials()
+        return
     result = adapter.test_credentials()
 
     assert isinstance(result, CredentialTestFailure)
@@ -946,7 +1061,8 @@ def test_webhook_only_acknowledges_consumer_acceptance(
     rejected_consumer = _RecordingConsumer(EventAcceptance.NOT_ACCEPTED)
 
     class _FailingConsumer:
-        def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+        def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+            del request_ip_address
             del event
             raise RuntimeError("sanitized consumer details")
 
@@ -962,6 +1078,7 @@ def test_real_socket_request_serialization_is_acked_only_after_acceptance(
     monkeypatch: pytest.MonkeyPatch,
     slack_api_server: _SlackApiServer,
 ) -> None:
+    """Given an SDK socket request, acknowledge it only after the consumer accepts the event."""
     control_request = SocketModeRequest(type="hello", envelope_id="sanitized-control", payload={})
     invalid_request = SocketModeRequest(type="events_api", envelope_id="sanitized-invalid", payload={})
     accepted_request = SocketModeRequest(
@@ -976,7 +1093,7 @@ def test_real_socket_request_serialization_is_acked_only_after_acceptance(
     )
 
     class _SocketTransport:
-        instance: _SocketTransport | None = None
+        instance: ClassVar[_SocketTransport | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             self.kwargs = kwargs
@@ -1001,6 +1118,7 @@ def test_real_socket_request_serialization_is_acked_only_after_acceptance(
     adapter, _ = _adapter(monkeypatch, slack_api_server)
     consumer = _RecordingConsumer()
     stream = adapter.create_stream_handler(consumer)
+    assert stream is not None
 
     stream.start()
 
@@ -1014,7 +1132,7 @@ def test_real_socket_request_serialization_is_acked_only_after_acceptance(
 
     stream.stop()
 
-    assert transport.closed is True
+    assert transport.closed
 
 
 @pytest.mark.parametrize("failure_stage", ["connect", "close"])
@@ -1039,6 +1157,7 @@ def test_socket_transport_failures_are_normalized(
     monkeypatch.setattr(slack_adapter_module, "SocketModeClient", _FailingSocketTransport)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
     stream = adapter.create_stream_handler(_RecordingConsumer())
+    assert stream is not None
 
     if failure_stage == "connect":
         with pytest.raises(IMStreamStartError):
@@ -1057,6 +1176,7 @@ def test_socket_sdk_disconnect_listeners_are_observable_and_safe(
     disconnect_kind: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Given an SDK disconnect notification, expose it safely to registered listeners."""
     sensitive_marker = f"sanitized-sensitive-remote-{disconnect_kind}"
     request = SocketModeRequest(
         type="events_api",
@@ -1066,7 +1186,7 @@ def test_socket_sdk_disconnect_listeners_are_observable_and_safe(
     consumer = _RecordingConsumer()
 
     class _ListenerSocketTransport:
-        instance: _ListenerSocketTransport | None = None
+        instance: ClassVar[_ListenerSocketTransport | None] = None
 
         def __init__(
             self,
@@ -1095,6 +1215,7 @@ def test_socket_sdk_disconnect_listeners_are_observable_and_safe(
     monkeypatch.setattr(slack_adapter_module, "SocketModeClient", _ListenerSocketTransport)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
     stream = adapter.create_stream_handler(consumer)
+    assert stream is not None
 
     with caplog.at_level("ERROR", logger=slack_adapter_module.__name__):
         stream.start()
@@ -1109,7 +1230,7 @@ def test_socket_sdk_disconnect_listeners_are_observable_and_safe(
 
     transport = _ListenerSocketTransport.instance
     assert transport is not None
-    assert transport.closed is True
+    assert transport.closed
     assert len(transport.responses) == 1
     assert len(consumer.events) == 1
     assert sensitive_marker not in caplog.text
@@ -1119,6 +1240,7 @@ def test_socket_start_waits_for_transport_construction(
     monkeypatch: pytest.MonkeyPatch,
     slack_api_server: _SlackApiServer,
 ) -> None:
+    """Given transport construction in progress, keep start pending until construction completes."""
     construction_started = threading.Event()
     release_construction = threading.Event()
     start_returned = threading.Event()
@@ -1126,7 +1248,7 @@ def test_socket_start_waits_for_transport_construction(
     lifecycle_errors: list[BaseException] = []
 
     class _ConstructionBlockedSocketTransport:
-        instance: _ConstructionBlockedSocketTransport | None = None
+        instance: ClassVar[_ConstructionBlockedSocketTransport | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -1146,6 +1268,7 @@ def test_socket_start_waits_for_transport_construction(
     monkeypatch.setattr(slack_adapter_module, "SocketModeClient", _ConstructionBlockedSocketTransport)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
     stream = adapter.create_stream_handler(_RecordingConsumer())
+    assert stream is not None
 
     def _manage_stream() -> None:
         try:
@@ -1172,7 +1295,7 @@ def test_socket_start_waits_for_transport_construction(
     owner_thread.join(2)
 
     assert not owner_thread.is_alive()
-    assert transport.closed is True
+    assert transport.closed
     assert lifecycle_errors == []
 
 
@@ -1180,6 +1303,7 @@ def test_socket_start_waits_for_connection_readiness_and_accepts_sdk_callback(
     monkeypatch: pytest.MonkeyPatch,
     slack_api_server: _SlackApiServer,
 ) -> None:
+    """Given a pending connection, wait for readiness and then accept the SDK callback."""
     connect_started = threading.Event()
     release_connect = threading.Event()
     start_returned = threading.Event()
@@ -1193,7 +1317,7 @@ def test_socket_start_waits_for_connection_readiness_and_accepts_sdk_callback(
     )
 
     class _SuccessfulSocketTransport:
-        instance: _SuccessfulSocketTransport | None = None
+        instance: ClassVar[_SuccessfulSocketTransport | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -1218,6 +1342,7 @@ def test_socket_start_waits_for_connection_readiness_and_accepts_sdk_callback(
     monkeypatch.setattr(slack_adapter_module, "SocketModeClient", _SuccessfulSocketTransport)
     adapter, _ = _adapter(monkeypatch, slack_api_server)
     stream = adapter.create_stream_handler(consumer)
+    assert stream is not None
 
     def _manage_stream() -> None:
         try:
@@ -1246,5 +1371,5 @@ def test_socket_start_waits_for_connection_readiness_and_accepts_sdk_callback(
     owner_thread.join(2)
 
     assert not owner_thread.is_alive()
-    assert transport.closed is True
+    assert transport.closed
     assert lifecycle_errors == []

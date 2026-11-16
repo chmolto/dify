@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -70,6 +70,22 @@ def _create_committed_identity(
         )
 
 
+def test_avatar_reference_is_persisted_and_can_be_cleared(sqlite_engine: Engine) -> None:
+    avatar_id = "00000000-0000-0000-0000-000000000601"
+    with Session(sqlite_engine) as session, session.begin():
+        repository = SQLAlchemyIMIdentityRepository(session, _CHANNEL_ONE)
+        created = repository.create(_IDENTITY_ONE, replace(_observation("provider-user"), avatar_file_id=avatar_id))
+        assert created.avatar_file_id == avatar_id
+    with Session(sqlite_engine) as session, session.begin():
+        repository = SQLAlchemyIMIdentityRepository(session, _CHANNEL_ONE)
+        restored = repository.get(_IDENTITY_ONE)
+        assert restored is not None
+        assert restored.avatar_file_id == avatar_id
+        assert repository.update(_IDENTITY_ONE, _observation("provider-user")).avatar_file_id is None
+    with Session(sqlite_engine) as session:
+        assert session.get_one(HumanInputIMIdentity, str(_IDENTITY_ONE)).avatar_file_id is None
+
+
 def test_identity_value_and_payload_are_owner_free_immutable_contracts() -> None:
     identity = IMIdentity(
         id=_IDENTITY_ONE,
@@ -82,16 +98,6 @@ def test_identity_value_and_payload_are_owner_free_immutable_contracts() -> None
         updated_at=_NOW,
     )
 
-    assert tuple(field.name for field in fields(IMIdentity)) == (
-        "id",
-        "provider_user_id",
-        "display_name",
-        "email",
-        "last_seen_sync_run_id",
-        "last_seen_at",
-        "created_at",
-        "updated_at",
-    )
     assert IMIdentityRepositoryError.__bases__ == (Exception,)
     assert OpaqueProviderPayload.model_config == {
         "frozen": True,
@@ -140,6 +146,25 @@ def test_blank_optional_profile_facts_are_persisted_as_null_pairs(sqlite_engine:
         assert (record.email, record.normalized_email) == (None, None)
 
 
+def test_get_many_returns_only_requested_current_channel_identities(sqlite_engine: Engine) -> None:
+    first = _create_committed_identity(sqlite_engine, _CHANNEL_ONE, _IDENTITY_ONE, "user-1")
+    second = _create_committed_identity(sqlite_engine, _CHANNEL_ONE, _IDENTITY_TWO, "user-2")
+    foreign_id = IMIdentityId("00000000-0000-0000-0000-000000000203")
+    unrequested_id = IMIdentityId("00000000-0000-0000-0000-000000000204")
+    missing_id = IMIdentityId("00000000-0000-0000-0000-000000000299")
+    _create_committed_identity(sqlite_engine, _CHANNEL_TWO, foreign_id, "foreign-user")
+    _create_committed_identity(sqlite_engine, _CHANNEL_ONE, unrequested_id, "unrequested-user")
+
+    with Session(sqlite_engine) as session:
+        repository = SQLAlchemyIMIdentityRepository(session, _CHANNEL_ONE)
+        assert repository.get_many(()) == ()
+        assert repository.get_many((missing_id, foreign_id)) == ()
+        identities = repository.get_many((_IDENTITY_TWO, foreign_id, _IDENTITY_ONE, _IDENTITY_ONE, missing_id))
+
+    assert len(identities) == 2
+    assert {identity.id: identity for identity in identities} == {_IDENTITY_ONE: first, _IDENTITY_TWO: second}
+
+
 def test_reads_search_and_update_are_channel_scoped(sqlite_engine: Engine) -> None:
     _create_committed_identity(sqlite_engine, _CHANNEL_ONE, _IDENTITY_ONE, "shared-user")
     _create_committed_identity(sqlite_engine, _CHANNEL_TWO, _IDENTITY_TWO, "shared-user")
@@ -179,7 +204,7 @@ def test_reads_search_and_update_are_channel_scoped(sqlite_engine: Engine) -> No
 @pytest.mark.parametrize(("page", "limit"), [(0, 1), (-1, 1), (1, 0), (1, 101)])
 def test_search_rejects_invalid_page_boundaries(sqlite_engine: Engine, page: int, limit: int) -> None:
     with Session(sqlite_engine) as session:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="page must be positive|limit must be between 1 and 100"):
             SQLAlchemyIMIdentityRepository(session, _CHANNEL_ONE).search(page=page, limit=limit)
 
 

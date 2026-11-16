@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import mimetypes
 from collections.abc import Callable, Sequence
+from itertools import batched
 from typing import Protocol
 
 import sqlalchemy as sa
@@ -11,6 +14,7 @@ from pydantic import NaiveDatetime
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, sessionmaker
 
+from configs import dify_config
 from core.human_input_v2.entities import IMProvider, IMSyncRemovalReason, IMSyncResultType, IMSyncRunStatus
 from core.human_input_v2.im_integration import (
     BlockedReconciliation,
@@ -34,29 +38,36 @@ from core.human_input_v2.im_integration import (
     SyncResultFact,
 )
 from core.human_input_v2.im_integration.adapters import IMProviderAdapter
-from core.human_input_v2.im_integration.adapters.entities import DirectoryReadFailure, ProviderUserId
+from core.human_input_v2.im_integration.adapters.entities import DirectoryEntry, DirectoryReadFailure, ProviderUserId
+from core.human_input_v2.im_integration.sync_records import AccountIMSyncInitiator
 from core.human_input_v2.shared import (
+    AccountId,
     ContactId,
     IMBindingId,
     IMIdentityId,
     IMReconciliationChangeId,
     IMSyncResultId,
     IMSyncRunId,
-    IntegrationId,
     NormalizedEmail,
+    TenantId,
 )
+from extensions.ext_storage import storage
+from extensions.storage.storage_type import StorageType
 from libs.datetime_utils import naive_utc_now
 from libs.uuid_utils import uuidv7
-from models.human_input_v2 import HumanInputIMChannel, HumanInputIMSyncRun
+from models.account import Account, TenantAccountJoin, TenantAccountRole
+from models.enums import CreatorUserRole
+from models.human_input_v2 import HumanInputIMBinding, HumanInputIMChannel, HumanInputIMSyncRun
+from models.model import UploadFile
 from repositories.human_input_v2.contact import Contact, ContactType
-from repositories.human_input_v2.im_binding_repository import IMBindingAssignment
-from repositories.human_input_v2.im_channel_repository import IMChannel
+from repositories.human_input_v2.im_channel_repository import IMChannel, IMChannelId
 from repositories.human_input_v2.im_identity_repository import IMIdentity, IMIdentityObservation, OpaqueProviderPayload
 from repositories.human_input_v2.im_integration.mappers import (
     reconciliation_change_to_record,
     sync_result_to_record,
     sync_run_from_record,
 )
+from repositories.human_input_v2.im_integration.repository import SQLAlchemyIMControlPlaneRepository
 from repositories.human_input_v2.sqlalchemy_im_binding_repository import SQLAlchemyIMBindingRepository
 from repositories.human_input_v2.sqlalchemy_im_identity_repository import SQLAlchemyIMIdentityRepository
 from services.human_input_v2.im_credential_codec import IMCredentialError
@@ -67,6 +78,7 @@ from .service import IMSyncRunNotFoundError
 logger = logging.getLogger(__name__)
 
 _CONTACT_PAGE_LIMIT = 500
+_BINDING_WRITE_BATCH_SIZE = 300
 
 
 class IMSyncRetryableError(RuntimeError):
@@ -109,6 +121,7 @@ class IMChannelReconciliationService:
         adapter_factory: IMChannelAdapterFactory,
         contact_reader_factory: BoundContactReaderFactory,
         *,
+        tenant_id: TenantId | None = None,
         clock: Callable[[], NaiveDatetime] = naive_utc_now,
     ) -> None:
         self._session_factory = session_factory
@@ -116,11 +129,22 @@ class IMChannelReconciliationService:
         self._adapter_factory = adapter_factory
         self._contact_reader_factory = contact_reader_factory
         self._clock = clock
+        self._tenant_id = tenant_id
 
     def reconcile(self, sync_run_id: IMSyncRunId) -> IMSyncRun:
         adapter: IMProviderAdapter | None = None
         try:
             run = self._require_run(sync_run_id)
+            if run.channel_revision.channel_id != str(self._channel.id):
+                raise IMSyncRunNotFoundError("IM synchronization run was not found")
+            if run.channel_revision.config_version < self._channel.config_version:
+                with self._session_factory() as session, session.begin():
+                    stale_run = SQLAlchemyIMControlPlaneRepository(session, self._channel).finish_stale_run(
+                        sync_run_id, now=self._clock()
+                    )
+                if stale_run is None:
+                    raise IMSyncRetryableError("IM Channel revision changed during stale run completion")
+                return stale_run
             if not self._run_matches_channel(run):
                 raise IMSyncRunNotFoundError("IM synchronization run was not found")
             if not run.is_active:
@@ -151,6 +175,7 @@ class IMChannelReconciliationService:
                     "Provider directory could not be read.",
                 )
             try:
+                avatar_files = self._prepare_avatar_files(run, directory.entries)
                 with self._session_factory() as session, session.begin():
                     run_record = self._require_active_run_record(session, sync_run_id)
                     identities = SQLAlchemyIMIdentityRepository(session, self._channel.id)
@@ -173,7 +198,7 @@ class IMChannelReconciliationService:
                             self._clock(),
                         )
                     else:
-                        self._apply_plan(session, run_record, plan_or_block, contacts, identities, bindings)
+                        self._apply_plan(session, run_record, plan_or_block, contacts, identities, avatar_files)
             except _ReconciliationAlreadyTerminalError as terminal:
                 return terminal.run
             except _StaleChannelRevisionError:
@@ -205,6 +230,56 @@ class IMChannelReconciliationService:
                 except Exception:
                     logger.exception("IM Provider adapter close failed, sync_run_id=%s", sync_run_id)
 
+    def _prepare_avatar_files(
+        self, run: IMSyncRun, entries: tuple[DirectoryEntry, ...]
+    ) -> dict[ProviderUserId, UploadFile]:
+        # Deployment file ownership is not supported yet. Composition supplies a
+        # tenant only for Workspace Channels.
+        if self._tenant_id is None or not any(entry.avatar is not None for entry in entries):
+            return {}
+        created_by = run.started_by.account_id if isinstance(run.started_by, AccountIMSyncInitiator) else None
+        if created_by is None:
+            with self._session_factory() as session:
+                owner_id = session.scalar(
+                    sa.select(Account.id)
+                    .join(TenantAccountJoin, TenantAccountJoin.account_id == Account.id)
+                    .where(
+                        TenantAccountJoin.tenant_id == str(self._tenant_id),
+                        TenantAccountJoin.role == TenantAccountRole.OWNER,
+                    )
+                )
+            if owner_id is None:
+                raise ValueError("Workspace owner is unavailable for IM avatar storage")
+            created_by = AccountId(owner_id)
+        now = self._clock()
+        avatar_files: dict[ProviderUserId, UploadFile] = {}
+        for entry in entries:
+            if entry.avatar is None:
+                continue
+            avatar = entry.avatar
+            suffix = mimetypes.guess_extension(avatar.mime_type) or ""
+            file_key = f"upload_files/{self._tenant_id}/{uuidv7()}{suffix}"
+            storage.save(file_key, avatar.data)
+            # Persist metadata with the Identity update, after storage I/O has
+            # completed. Orphaned objects from a failed apply need future GC.
+            avatar_files[entry.provider_user_id] = UploadFile(
+                tenant_id=str(self._tenant_id),
+                storage_type=StorageType(dify_config.STORAGE_TYPE),
+                key=file_key,
+                name=f"avatar{suffix}",
+                size=len(avatar.data),
+                extension=suffix.lstrip("."),
+                mime_type=avatar.mime_type,
+                created_by_role=CreatorUserRole.ACCOUNT,
+                created_by=str(created_by),
+                created_at=now,
+                used=True,
+                used_by=str(created_by),
+                used_at=now,
+                hash=hashlib.sha3_256(avatar.data).hexdigest(),
+            )
+        return avatar_files
+
     def _apply_plan(
         self,
         session: Session,
@@ -212,7 +287,7 @@ class IMChannelReconciliationService:
         plan: ReconciliationPlan,
         contacts: tuple[Contact, ...],
         identities: SQLAlchemyIMIdentityRepository,
-        bindings: SQLAlchemyIMBindingRepository,
+        avatar_files: dict[ProviderUserId, UploadFile],
     ) -> None:
         now = self._clock()
         initial_identities = {identity.id: identity for identity in identities.list_all()}
@@ -220,6 +295,9 @@ class IMChannelReconciliationService:
         binding_ids: dict[tuple[IMIdentityId, ContactId], IMBindingId] = {}
         changes: list[IMReconciliationChange] = []
         for upsert in plan.identity_upserts:
+            avatar_file = avatar_files.get(upsert.entry.provider_user_id)
+            if avatar_file is not None:
+                session.add(avatar_file)
             observation = IMIdentityObservation(
                 provider_user_id=str(upsert.entry.provider_user_id),
                 display_name=upsert.entry.display_name,
@@ -227,6 +305,7 @@ class IMChannelReconciliationService:
                 raw_payload=OpaqueProviderPayload({}),
                 sync_run_id=plan.run.sync_run_id,
                 observed_at=now,
+                avatar_file_id=avatar_file.id if avatar_file is not None else None,
             )
             if isinstance(upsert.identity_ref, NewIMIdentityRef):
                 identity_id = IMIdentityId(str(uuidv7()))
@@ -243,7 +322,7 @@ class IMChannelReconciliationService:
             changes.append(
                 IMReconciliationChange(
                     id=IMReconciliationChangeId(str(uuidv7())),
-                    integration_id=IntegrationId(str(self._channel.id)),
+                    channel_id=IMChannelId(str(self._channel.id)),
                     sync_run_id=plan.run.sync_run_id,
                     operation_key=upsert.operation_key,
                     subject_kind=IMReconciliationSubjectKind.IDENTITY,
@@ -263,20 +342,19 @@ class IMChannelReconciliationService:
             )
 
         contact_by_id = {contact.id: contact for contact in contacts}
+        bindings_to_delete: list[IMBindingChangeSnapshot] = []
+        bindings_to_create: list[IMBindingChangeSnapshot] = []
         for mutation in plan.binding_mutations:
             if isinstance(mutation, CreateIMBinding):
                 self._require_contact_precondition(contact_by_id, mutation.contact_precondition)
                 identity_id = self._resolve_identity(mutation.identity_ref, identity_ids)
-                created_binding = bindings.create(
-                    IMBindingAssignment(mutation.contact_id, identity_id, now),
-                    bound_by_account_id=None,
-                )
-                binding_ids[(identity_id, mutation.contact_id)] = created_binding.id
                 created_after_snapshot = self._binding_snapshot(
-                    created_binding.id,
-                    created_binding.identity_id,
-                    created_binding.contact_id,
+                    IMBindingId(str(uuidv7())),
+                    identity_id,
+                    mutation.contact_id,
                 )
+                bindings_to_create.append(created_after_snapshot)
+                binding_ids[(identity_id, mutation.contact_id)] = created_after_snapshot.binding_id
                 changes.append(
                     self._binding_change(
                         plan,
@@ -292,26 +370,19 @@ class IMChannelReconciliationService:
             elif isinstance(mutation, ReplaceIMBinding):
                 self._require_contact_precondition(contact_by_id, mutation.contact_precondition)
                 identity_id = self._resolve_identity(mutation.next_identity_ref, identity_ids)
-                replaced_binding = bindings.replace(
-                    mutation.before.binding_id,
-                    expected_identity_id=mutation.before.identity_id,
-                    next_identity_id=identity_id,
-                    bound_by_account_id=None,
-                    updated_at=now,
-                )
-                if replaced_binding is None:
-                    raise _ReconciliationPreconditionError
-                binding_ids[(identity_id, mutation.before.contact_id)] = replaced_binding.id
                 replaced_before_snapshot = self._binding_snapshot(
                     mutation.before.binding_id,
                     mutation.before.identity_id,
                     mutation.before.contact_id,
                 )
                 replaced_after_snapshot = self._binding_snapshot(
-                    replaced_binding.id,
-                    replaced_binding.identity_id,
-                    replaced_binding.contact_id,
+                    IMBindingId(str(uuidv7())),
+                    identity_id,
+                    mutation.before.contact_id,
                 )
+                bindings_to_delete.append(replaced_before_snapshot)
+                bindings_to_create.append(replaced_after_snapshot)
+                binding_ids[(identity_id, mutation.before.contact_id)] = replaced_after_snapshot.binding_id
                 changes.append(
                     self._binding_change(
                         plan,
@@ -325,22 +396,12 @@ class IMChannelReconciliationService:
                     )
                 )
             elif isinstance(mutation, DeleteIMBinding):
-                current_binding = bindings.get(mutation.before.binding_id)
-                if (
-                    current_binding is None
-                    or current_binding.identity_id != mutation.before.identity_id
-                    or current_binding.contact_id != mutation.before.contact_id
-                ):
-                    raise _ReconciliationPreconditionError
-                bindings.delete(
-                    mutation.before.binding_id,
-                    expected_identity_id=mutation.before.identity_id,
-                )
                 deleted_before_snapshot = self._binding_snapshot(
                     mutation.before.binding_id,
                     mutation.before.identity_id,
                     mutation.before.contact_id,
                 )
+                bindings_to_delete.append(deleted_before_snapshot)
                 changes.append(
                     self._binding_change(
                         plan,
@@ -353,6 +414,7 @@ class IMChannelReconciliationService:
                         now=now,
                     )
                 )
+        self._persist_binding_changes(session, bindings_to_delete, bindings_to_create, now)
         for deletion in plan.identity_deletions:
             current_identity = identities.get(deletion.before.identity_id)
             if current_identity is None or not self._identity_matches_state(current_identity, deletion.before):
@@ -361,7 +423,7 @@ class IMChannelReconciliationService:
             changes.append(
                 IMReconciliationChange(
                     id=IMReconciliationChangeId(str(uuidv7())),
-                    integration_id=IntegrationId(str(self._channel.id)),
+                    channel_id=IMChannelId(str(self._channel.id)),
                     sync_run_id=plan.run.sync_run_id,
                     operation_key=deletion.operation_key,
                     subject_kind=IMReconciliationSubjectKind.IDENTITY,
@@ -399,6 +461,55 @@ class IMChannelReconciliationService:
         run_record.finished_at = now
         run_record.updated_at = now
         session.flush()
+
+    def _persist_binding_changes(
+        self,
+        session: Session,
+        removed: Sequence[IMBindingChangeSnapshot],
+        added: Sequence[IMBindingChangeSnapshot],
+        now: NaiveDatetime,
+    ) -> None:
+        # Apply the plan without re-deciding individual assignments. Check the
+        # captured endpoints and free them before inserting replacement Bindings.
+        for batch in batched(removed, _BINDING_WRITE_BATCH_SIZE, strict=False):
+            deleted_ids = set(
+                session.scalars(
+                    sa.delete(HumanInputIMBinding)
+                    .where(
+                        HumanInputIMBinding.channel_id == str(self._channel.id),
+                        sa.tuple_(
+                            HumanInputIMBinding.id,
+                            HumanInputIMBinding.im_identity_id,
+                            HumanInputIMBinding.contact_id,
+                        ).in_(
+                            [
+                                (str(binding.binding_id), str(binding.identity_id), str(binding.contact_id))
+                                for binding in batch
+                            ]
+                        ),
+                    )
+                    .returning(HumanInputIMBinding.id)
+                    .execution_options(autoflush=False)
+                )
+            )
+            if deleted_ids != {str(binding.binding_id) for binding in batch}:
+                raise _ReconciliationPreconditionError
+        for batch in batched(added, _BINDING_WRITE_BATCH_SIZE, strict=False):
+            session.execute(
+                sa.insert(HumanInputIMBinding),
+                [
+                    {
+                        "id": str(binding.binding_id),
+                        "channel_id": str(self._channel.id),
+                        "contact_id": str(binding.contact_id),
+                        "im_identity_id": str(binding.identity_id),
+                        "bound_by_account_id": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                    for binding in batch
+                ],
+            )
 
     def _materialize_results(
         self,
@@ -439,7 +550,7 @@ class IMChannelReconciliationService:
             results.append(
                 SyncResultFact(
                     id=IMSyncResultId(str(uuidv7())),
-                    integration_id=IntegrationId(str(self._channel.id)),
+                    channel_id=IMChannelId(str(self._channel.id)),
                     sync_run_id=plan.run.sync_run_id,
                     operation_key=planned.operation_key,
                     result_type=planned.result_type,
@@ -543,7 +654,7 @@ class IMChannelReconciliationService:
     ) -> IMReconciliationChange:
         return IMReconciliationChange(
             id=IMReconciliationChangeId(str(uuidv7())),
-            integration_id=IntegrationId(plan.run.channel_revision.channel_id),
+            channel_id=IMChannelId(plan.run.channel_revision.channel_id),
             sync_run_id=plan.run.sync_run_id,
             operation_key=operation_key,
             subject_kind=IMReconciliationSubjectKind.BINDING,
@@ -576,7 +687,7 @@ class IMChannelReconciliationService:
     ) -> None:
         diagnostic = SyncResultFact(
             id=IMSyncResultId(str(uuidv7())),
-            integration_id=IntegrationId(record.integration_id),
+            channel_id=IMChannelId(record.channel_id),
             sync_run_id=IMSyncRunId(record.id),
             operation_key=f"diagnostic:{code}",
             result_type=IMSyncResultType.FAILED,
@@ -626,7 +737,7 @@ class IMChannelReconciliationService:
                 HumanInputIMChannel.config_version == self._channel.config_version,
                 HumanInputIMChannel.provider == self._channel.provider,
             )
-            .values(updated_at=HumanInputIMChannel.updated_at)
+            .values({HumanInputIMChannel.updated_at: HumanInputIMChannel.updated_at})
             .execution_options(autoflush=False, synchronize_session=False)
         )
         if not isinstance(result, CursorResult):
@@ -636,8 +747,8 @@ class IMChannelReconciliationService:
     def _lock_active_run(self, session: Session, sync_run_id: IMSyncRunId) -> HumanInputIMSyncRun:
         predicates = (
             HumanInputIMSyncRun.id == str(sync_run_id),
-            HumanInputIMSyncRun.integration_id == str(self._channel.id),
-            HumanInputIMSyncRun.integration_config_version == self._channel.config_version,
+            HumanInputIMSyncRun.channel_id == str(self._channel.id),
+            HumanInputIMSyncRun.channel_config_version == self._channel.config_version,
             HumanInputIMSyncRun.provider == self._channel.provider,
         )
         result = session.execute(
@@ -646,7 +757,7 @@ class IMChannelReconciliationService:
                 *predicates,
                 HumanInputIMSyncRun.status.in_((IMSyncRunStatus.QUEUED, IMSyncRunStatus.RUNNING)),
             )
-            .values(updated_at=HumanInputIMSyncRun.updated_at)
+            .values({HumanInputIMSyncRun.updated_at: HumanInputIMSyncRun.updated_at})
             .execution_options(autoflush=False, synchronize_session=False)
         )
         if not isinstance(result, CursorResult):

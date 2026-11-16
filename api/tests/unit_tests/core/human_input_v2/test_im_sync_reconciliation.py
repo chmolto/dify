@@ -28,6 +28,7 @@ from core.human_input_v2.im_integration import (
     SyncReconciler,
 )
 from core.human_input_v2.im_integration.adapters import DirectoryEntry, ProviderUserId
+from core.human_input_v2.im_integration.sync_records import AccountIMSyncInitiator
 from core.human_input_v2.shared import (
     AccountId,
     ContactId,
@@ -114,7 +115,7 @@ def test_sync_run_captures_complete_channel_revision() -> None:
         sync_run_id=IMSyncRunId("run-1"),
         channel_revision=_RUN.channel_revision,
         provider=IMProvider.FEISHU,
-        started_by_account_id=AccountId("account-1"),
+        started_by=AccountIMSyncInitiator(AccountId("account-1")),
         now=_NOW,
     )
 
@@ -430,7 +431,9 @@ def test_planner_output_is_independent_of_fact_order() -> None:
         "contacts": (_contact("contact-2", "two@example.com"), _contact("contact-1", "one@example.com")),
     }
 
-    first = SyncReconciler.generate_plan(_input(**facts))
+    first = SyncReconciler.generate_plan(
+        _input(entries=facts["entries"], identities=facts["identities"], contacts=facts["contacts"])
+    )
     second = SyncReconciler.generate_plan(
         _input(
             entries=tuple(reversed(facts["entries"])),

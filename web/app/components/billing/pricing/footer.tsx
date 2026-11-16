@@ -1,39 +1,38 @@
+import type { Locale } from '@/i18n/locale'
 import { useTranslation } from 'react-i18next'
+import { useLocale } from '#i18n'
 import Link from '@/next/link'
 
-export function PricingFooter({
-  pricingPageURL,
-  category,
-}: {
-  pricingPageURL: string
-  category: 'cloud' | 'self-hosted'
-}) {
-  const { t } = useTranslation()
+const websiteLocalePaths: Partial<Record<Locale, string>> = {
+  'zh-Hans': '/zh',
+  'ja-JP': '/ja',
+  'ko-KR': '/ko',
+}
+
+export function PricingFooter() {
+  const locale = useLocale()
+  const pricingPageURL = `https://dify.ai${websiteLocalePaths[locale] ?? ''}/pricing/dify-cloud#compare`
+  const { t } = useTranslation(['billing'])
 
   return (
-    <div className="flex min-h-16 w-full justify-center border-t border-divider-accent px-10">
-      <div
-        data-category={category}
-        className="flex max-w-[1680px] grow justify-end border-x border-divider-accent p-6 data-[category=cloud]:justify-between"
-      >
-        {category === 'cloud' && (
-          <div className="flex flex-col text-text-tertiary">
-            <span className="system-xs-regular">
-              {t(($) => $['plansCommon.taxTip'], { ns: 'billing' })}
-            </span>
-          </div>
-        )}
-        <span className="flex h-fit items-center gap-x-1 text-saas-dify-blue-accessible">
-          <Link
-            href={pricingPageURL}
-            className="system-md-regular hover:underline focus-visible:underline focus-visible:outline-hidden"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
+    <div className="flex pt-6 font-[PricingInter,sans-serif] xl:px-6">
+      <div className="flex min-w-0 grow flex-wrap items-center justify-between gap-4">
+        <div className="flex min-w-0 flex-1 flex-col text-text-tertiary">
+          <span className="system-md-regular">
+            {t(($) => $['plansCommon.taxTip'], { ns: 'billing' })}
+          </span>
+        </div>
+        <Link
+          href={pricingPageURL}
+          className="group flex h-fit min-w-0 items-center gap-x-1 rounded-xs system-md-regular text-text-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-state-accent-solid xl:shrink-0"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <span className="group-hover:underline group-focus-visible:underline">
             {t(($) => $['plansCommon.comparePlanAndFeatures'], { ns: 'billing' })}
-          </Link>
-          <span aria-hidden="true" className="i-ri-arrow-right-up-line size-4" />
-        </span>
+          </span>
+          <span aria-hidden className="i-ri-arrow-right-up-line size-6 shrink-0" />
+        </Link>
       </div>
     </div>
   )

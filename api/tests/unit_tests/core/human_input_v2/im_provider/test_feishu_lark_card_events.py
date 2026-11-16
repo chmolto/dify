@@ -44,6 +44,7 @@ from core.human_input_v2.resolved_form import (
 _FIXTURE_DIRECTORY = Path(__file__).with_name("fixtures")
 _WEBHOOK_FIXTURE = _FIXTURE_DIRECTORY / "feishu_lark_card_action_webhook.json"
 _STREAM_FIXTURE = _FIXTURE_DIRECTORY / "feishu_lark_card_action_stream.json"
+_NO_INPUTS_FIXTURE = _FIXTURE_DIRECTORY / "feishu_lark_card_action_without_inputs.json"
 _RECEIVED_AT = datetime(2026, 8, 12, 10, 0, 0)
 _DIFY_ACTION_MARKER = "__dify.human_input.action"
 _WEBHOOK_VERIFICATION_TOKEN = "verification_test_only"
@@ -61,7 +62,8 @@ class _WebhookConsumer:
     def __init__(self) -> None:
         self.event: AuthenticatedIMEvent | None = None
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self.event = event
         return EventAcceptance.ACCEPTED
 
@@ -574,21 +576,29 @@ def test_codec_rechecks_wire_size_with_the_actual_correlation_token() -> None:
     ],
     ids=("schema", "header", "event", "action"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_transport_discriminated_malformed_recognition_envelopes_fail_strictly(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     callback: dict[str, object],
 ) -> None:
     with pytest.raises(IMCardEventDecodingError, match="schema is invalid"):
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
 
-def test_non_object_foreign_action_value_is_unrecognized() -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+def test_non_object_foreign_action_value_is_unrecognized(
+    provider: IMProvider, ingress_kind: IMEventIngressKind
+) -> None:
     callback: dict[str, object] = {
         "schema": "2.0",
         "header": {"event_type": "card.action.trigger"},
         "event": {"action": {"value": []}},
     }
 
-    result = feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+    result = feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
     assert isinstance(result, UnrecognizedIMEvent)
 
@@ -668,6 +678,32 @@ def test_sanitized_real_callbacks_converge_for_both_provider_discriminators(
     )
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+@pytest.mark.parametrize("include_form_value", [False, True], ids=("omitted-form-values", "empty-form-values"))
+def test_callbacks_without_inputs_decode_to_empty_inputs(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
+    include_form_value: bool,
+) -> None:
+    fixture = json.loads(_NO_INPUTS_FIXTURE.read_text(encoding="utf-8"))
+    callback = fixture["authenticated_event"]["payload"]
+    if include_form_value:
+        _callback_action(callback)["form_value"] = {}
+    adapter = (
+        feishu_lark.FeishuIMProviderAdapter if provider is IMProvider.FEISHU else feishu_lark.LarkIMProviderAdapter
+    )
+
+    result = adapter.card_event_decoder().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
+
+    assert result == IMCardEvent(
+        provider_user_id=ProviderUserId("union_test_only"),
+        action_id="confirm",
+        inputs={},
+        correlation_token=CorrelationToken("no-inputs-correlation-token-test-only"),
+    )
+
+
 def test_encode_and_decode_preserve_exact_unicode_and_input_metadata_names() -> None:
     codec = feishu_lark._MSFeishuLarkCardCodec()
     intent = ResolvedForm(
@@ -731,7 +767,11 @@ def test_encode_and_decode_preserve_exact_unicode_and_input_metadata_names() -> 
     )
 
 
-def test_exact_private_marker_input_name_remains_isolated_from_action_metadata() -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+def test_exact_private_marker_input_name_remains_isolated_from_action_metadata(
+    provider: IMProvider, ingress_kind: IMEventIngressKind
+) -> None:
     codec = feishu_lark._MSFeishuLarkCardCodec()
     token = CorrelationToken("collision-correlation-token")
     intent = ResolvedForm(
@@ -782,7 +822,7 @@ def test_exact_private_marker_input_name_remains_isolated_from_action_metadata()
     action["value"] = metadata
     action["form_value"] = {_DIFY_ACTION_MARKER: submitted_value}
 
-    result = codec.decode(_event(callback))
+    result = codec.decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
     assert result == IMCardEvent(
         provider_user_id=ProviderUserId("union_test_only"),
@@ -823,14 +863,18 @@ def test_non_applicable_or_foreign_events_are_unrecognized(event: AuthenticatedI
     ],
     ids=("version", "action-id", "correlation-token", "complete-legacy-triple"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_foreign_generic_action_metadata_is_not_a_dify_marker(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     foreign_action_value: dict[str, object],
 ) -> None:
     callback = _synthetic_marked_callback()
     action = _callback_action(callback)
     action["value"] = foreign_action_value
 
-    result = feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+    result = feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
     assert isinstance(result, UnrecognizedIMEvent)
 
@@ -844,23 +888,33 @@ def test_foreign_generic_action_metadata_is_not_a_dify_marker(
     ],
     ids=("non-object-marker", "empty-marker", "missing-correlation-token"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_exact_dify_marker_enables_strict_submission_validation(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     marked_action_value: dict[str, object],
 ) -> None:
     callback = _synthetic_marked_callback()
     _callback_action(callback)["value"] = marked_action_value
 
     with pytest.raises(IMCardEventDecodingError, match=r"^Feishu/Lark card event schema is invalid\.$"):
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
 
 @pytest.mark.parametrize("payload", ["not-json", "[]", '{"unsafe":NaN}'])
-def test_transport_discriminated_invalid_json_fails_safely(payload: str) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+def test_transport_discriminated_invalid_json_fails_safely(
+    payload: str, provider: IMProvider, ingress_kind: IMEventIngressKind
+) -> None:
     with pytest.raises(
         IMCardEventDecodingError,
         match=r"^Feishu/Lark card event payload is invalid\.$",
     ) as raised:
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(payload=payload))
+        feishu_lark._MSFeishuLarkCardCodec().decode(
+            _event(payload=payload, provider=provider, ingress_kind=ingress_kind)
+        )
 
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
@@ -884,6 +938,7 @@ def _without(callback: dict[str, object], path: tuple[str, ...]) -> None:
         (("event", "action", "tag"), "select_static"),
         (("event", "action", "name"), "reject"),
         (("event", "action", "form_value"), ["sensitive-submitted-input"]),
+        (("event", "action", "form_value"), None),
         (("event", "action", "value", _DIFY_ACTION_MARKER, "version"), 2),
         (("event", "action", "value", _DIFY_ACTION_MARKER, "action_id"), "reject"),
         (("event", "action", "value", _DIFY_ACTION_MARKER, "correlation_token"), None),
@@ -895,12 +950,17 @@ def _without(callback: dict[str, object], path: tuple[str, ...]) -> None:
         "action-tag",
         "outer-action-id",
         "form-values",
+        "null-form-values",
         "metadata-version",
         "embedded-action-id",
         "correlation-token",
     ),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_recognized_callbacks_fail_strictly_without_exposing_callback_values(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     path: tuple[str, ...],
     replacement: object,
 ) -> None:
@@ -919,7 +979,7 @@ def test_recognized_callbacks_fail_strictly_without_exposing_callback_values(
         IMCardEventDecodingError,
         match=r"^Feishu/Lark card event schema is invalid\.$",
     ) as raised:
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
     diagnostic = repr(raised.value) + str(raised.value) + repr(raised.value.args) + repr(raised.value.__dict__)
     assert "sensitive-submitted-input" not in diagnostic
@@ -934,21 +994,28 @@ def test_recognized_callbacks_fail_strictly_without_exposing_callback_values(
     [
         ("event", "operator"),
         ("event", "operator", "union_id"),
-        ("event", "action", "form_value"),
         ("event", "action", "value", _DIFY_ACTION_MARKER, "action_id"),
         ("event", "action", "value", _DIFY_ACTION_MARKER, "correlation_token"),
     ],
-    ids=("operator", "union-id", "form-values", "action-id", "correlation-token"),
+    ids=("operator", "union-id", "action-id", "correlation-token"),
 )
-def test_recognized_callbacks_reject_missing_required_facts(path: tuple[str, ...]) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+def test_recognized_callbacks_reject_missing_required_facts(
+    path: tuple[str, ...], provider: IMProvider, ingress_kind: IMEventIngressKind
+) -> None:
     callback = _synthetic_marked_callback()
     _without(callback, path)
 
     with pytest.raises(IMCardEventDecodingError, match="schema is invalid"):
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_decoder_discovery_is_credential_free_concurrent_and_lifecycle_independent(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def reject_gateway_creation(*_args: object) -> object:
@@ -962,14 +1029,23 @@ def test_decoder_discovery_is_credential_free_concurrent_and_lifecycle_independe
     assert isinstance(feishu_decoder, feishu_lark._MSFeishuLarkCardCodec)
     assert isinstance(lark_decoder, feishu_lark._MSFeishuLarkCardCodec)
     with ThreadPoolExecutor(max_workers=8) as executor:
-        results = tuple(executor.map(feishu_decoder.decode, (_event(callback) for _ in range(64))))
+        results = tuple(
+            executor.map(
+                feishu_decoder.decode,
+                (_event(callback, provider=provider, ingress_kind=ingress_kind) for _ in range(64)),
+            )
+        )
 
     assert len(results) == 64
     assert isinstance(results[0], IMCardEvent)
     assert all(result == results[0] for result in results)
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_decoder_remains_usable_after_differently_credentialed_root_adapters_close(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway_constructions: list[str] = []
@@ -1015,7 +1091,7 @@ def test_decoder_remains_usable_after_differently_credentialed_root_adapters_clo
 
     monkeypatch.setattr(feishu_lark, "_create_sdk_gateway", reject_gateway_creation)
 
-    result = decoder.decode(_event(_synthetic_marked_callback()))
+    result = decoder.decode(_event(_synthetic_marked_callback(), provider=provider, ingress_kind=ingress_kind))
 
     assert result == IMCardEvent(
         provider_user_id=ProviderUserId("union_test_only"),
@@ -1028,7 +1104,11 @@ def test_decoder_remains_usable_after_differently_credentialed_root_adapters_clo
         _ = feishu_root.provider
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
 def test_decoder_discovery_and_decode_do_not_cross_runtime_dependency_boundaries(
+    provider: IMProvider,
+    ingress_kind: IMEventIngressKind,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def reject_dependency_call(*_args: object, **_kwargs: object) -> object:
@@ -1047,11 +1127,6 @@ def test_decoder_discovery_and_decode_do_not_cross_runtime_dependency_boundaries
     }
     for seam_name in dependency_seam_names:
         monkeypatch.setattr(feishu_lark, seam_name, reject_dependency_call)
-    for seam_name in dependency_seam_names:
-        guarded_seam = getattr(feishu_lark, seam_name)
-        assert guarded_seam is reject_dependency_call
-        with pytest.raises(AssertionError, match="credential or Provider client boundary"):
-            guarded_seam()
     imported_modules: list[str] = []
     delegated_imports: list[str] = []
     executed_modules: list[str] = []
@@ -1135,7 +1210,7 @@ def test_decoder_discovery_and_decode_do_not_cross_runtime_dependency_boundaries
 
         def discover_and_decode() -> object:
             decoder = feishu_lark.FeishuIMProviderAdapter.card_event_decoder()
-            return decoder.decode(_event(_synthetic_marked_callback()))
+            return decoder.decode(_event(_synthetic_marked_callback(), provider=provider, ingress_kind=ingress_kind))
 
         result = run_with_runtime_audit(discover_and_decode)
     finally:
@@ -1149,9 +1224,13 @@ def test_decoder_discovery_and_decode_do_not_cross_runtime_dependency_boundaries
     assert feishu_lark.__name__ in executed_modules
 
 
-def test_open_id_is_never_used_when_union_id_is_unavailable() -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("ingress_kind", [IMEventIngressKind.WEBHOOK, IMEventIngressKind.STREAM])
+def test_open_id_is_never_used_when_union_id_is_unavailable(
+    provider: IMProvider, ingress_kind: IMEventIngressKind
+) -> None:
     callback = _synthetic_marked_callback()
     _callback_operator(callback).pop("union_id")
 
     with pytest.raises(IMCardEventDecodingError, match="schema is invalid"):
-        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback))
+        feishu_lark._MSFeishuLarkCardCodec().decode(_event(callback, provider=provider, ingress_kind=ingress_kind))

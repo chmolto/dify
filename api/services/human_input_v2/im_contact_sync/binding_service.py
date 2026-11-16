@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from core.human_input_v2.entities import HumanInputContactType, IMBindingScope
 from core.human_input_v2.im_integration import ContactIMBindingView, IMBindingCommandError, IMBindingCommandErrorCode
-from core.human_input_v2.shared import AccountId, ContactId, DirectoryScope, IMBindingId, IMIdentityId, TenantId
+from core.human_input_v2.shared import AccountId, ContactId, DirectoryScope, IMIdentityId, TenantId
 from libs.datetime_utils import naive_utc_now
 from repositories.human_input_v2.contact import IMBinding as ContactIMBinding
 from repositories.human_input_v2.im_binding_repository import (
@@ -40,7 +40,7 @@ class ContactIMBindingService:
         self._channel_resolver = channel_resolver
         self._clock = clock
 
-    def create_organization_binding(
+    def set_organization_binding(
         self,
         *,
         organization_scope: DirectoryScope,
@@ -49,11 +49,17 @@ class ContactIMBindingService:
         identity_id: IMIdentityId,
         bound_by_account_id: AccountId | None,
     ) -> ContactIMBindingView:
+        """Atomically replace either occupied default endpoint for a manual edit.
+
+        Identical assignments preserve the Binding ID and metadata. A changed
+        assignment creates a new ID, invalidating cards for replaced defaults.
+        Controller authorization determines whether default bindings are editable.
+        """
         return self._mutate(
             organization_scope,
             tenant_id,
             contact_id,
-            lambda repository: repository.create(
+            lambda repository: repository.replace(
                 IMBindingAssignment(contact_id, identity_id, self._clock()),
                 bound_by_account_id=bound_by_account_id,
             ),
@@ -64,14 +70,14 @@ class ContactIMBindingService:
         *,
         organization_scope: DirectoryScope,
         contact_id: ContactId,
-        binding_id: IMBindingId,
     ) -> None:
+        """Delete the Contact's current default Binding without changing workspace overrides."""
         tenant_id = _tenant_id(organization_scope)
         with self._session_factory() as session, session.begin():
             channel = self._require_channel(session, organization_scope)
             repository = SQLAlchemyIMBindingRepository(session, channel.id)
-            binding = repository.get(binding_id)
-            if binding is None or binding.contact_id != contact_id:
+            binding = repository.get_default_for_contact(contact_id)
+            if binding is None:
                 raise IMBindingCommandError(
                     IMBindingCommandErrorCode.BINDING_NOT_FOUND,
                     "IM Binding was not found",

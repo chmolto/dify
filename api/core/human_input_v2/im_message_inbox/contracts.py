@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import NewType, Protocol
 
 from core.human_input_v2.im_integration.adapters.entities import AuthenticatedIMEvent
-from core.human_input_v2.shared import IntegrationId
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 
 IM_INBOX_PROVIDER_METADATA_MAX_LENGTH = 128
 
@@ -73,9 +73,11 @@ class IMInboxRecord:
     """Persisted callback facts reconstructed for Celery processing."""
 
     record_id: IMInboxRecordId
-    integration_id: IntegrationId
+    channel_id: IMChannelId
     event: AuthenticatedIMEvent
     processed_at: datetime | None
+    # Absent for stream events and callbacks saved before IP capture was added.
+    request_ip_address: str | None = None
 
 
 class InboxPersistenceError(Exception):
@@ -93,7 +95,12 @@ class IMMessageInboxRepository(Protocol):
     """Persistence operations for durable callback facts."""
 
     def insert_or_resolve(
-        self, integration_id: IntegrationId, event: AuthenticatedIMEvent, *, now: datetime
+        self,
+        channel_id: IMChannelId,
+        event: AuthenticatedIMEvent,
+        *,
+        now: datetime,
+        request_ip_address: str | None = None,
     ) -> InboxAcceptance:
         """Commit a callback or resolve its identified duplicate."""
 

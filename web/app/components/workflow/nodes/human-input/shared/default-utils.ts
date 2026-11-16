@@ -2,6 +2,7 @@ import type { TFunction } from 'i18next'
 import type { FormInputItem, HumanInputSharedConfig } from './types'
 import type { Var } from '@/app/components/workflow/types'
 import { VarType } from '@/app/components/workflow/types'
+import { HUMAN_INPUT_TIMEOUT_HANDLE } from './constants'
 
 const getFormInputVarType = (input: FormInputItem): VarType => {
   if (input.type === 'file') return VarType.file
@@ -17,15 +18,20 @@ export const buildHumanInputOutputVars = (inputs: FormInputItem[]): Var[] =>
 
 export const getHumanInputSharedValidationError = (
   payload: Pick<HumanInputSharedConfig, 'user_actions'>,
-  t: TFunction<'workflow'>,
+  t: TFunction<['workflow']>,
 ): string => {
   if (!payload.user_actions.length)
     return t(($) => $['nodes.humanInput.errorMsg.noUserActions'], { ns: 'workflow' })
   if (new Set(payload.user_actions.map((action) => action.id)).size !== payload.user_actions.length)
     return t(($) => $['nodes.humanInput.errorMsg.duplicateActionId'], { ns: 'workflow' })
-  if (payload.user_actions.some((action) => !action.id.trim()))
+  if (payload.user_actions.some((action) => !action.id?.trim()))
     return t(($) => $['nodes.humanInput.errorMsg.emptyActionId'], { ns: 'workflow' })
-  if (payload.user_actions.some((action) => !action.title.trim()))
+  if (payload.user_actions.some((action) => action.id === HUMAN_INPUT_TIMEOUT_HANDLE))
+    return t(($) => $['nodes.humanInput.errorMsg.reservedActionId'], {
+      ns: 'workflow',
+      id: HUMAN_INPUT_TIMEOUT_HANDLE,
+    })
+  if (payload.user_actions.some((action) => !action.title?.trim()))
     return t(($) => $['nodes.humanInput.errorMsg.emptyActionTitle'], { ns: 'workflow' })
   return ''
 }

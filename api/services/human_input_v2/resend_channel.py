@@ -1,4 +1,4 @@
-"""Request-scoped Resend test-delivery adapter for Human Input v2."""
+"""Request-scoped Resend delivery adapter for Human Input v2."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Never, Protocol
 
 import httpx
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from core.helper import ssrf_proxy
 from libs.uuid_utils import uuidv7
@@ -25,6 +26,12 @@ _TEST_HTML = (
 )
 
 
+class _ResendErrorResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True, hide_input_in_errors=True)
+
+    name: str | None = None
+
+
 class ResendHTTPResponse(Protocol):
     status_code: int
 
@@ -36,7 +43,7 @@ class ResendHTTPClient(Protocol):
 
 
 class ResendProviderGateway:
-    """Perform Resend management I/O without shared SDK credential state."""
+    """Perform Resend delivery I/O without shared SDK credential state."""
 
     def __init__(
         self,
@@ -54,17 +61,39 @@ class ResendProviderGateway:
     def send_test(self, candidate: ResendCandidate) -> None:
         """Verify the candidate through one idempotent Resend test delivery."""
 
+        self._send_message(
+            candidate,
+            to=_TEST_RECIPIENT,
+            subject=_TEST_SUBJECT,
+            html=_TEST_HTML,
+            idempotency_key=f"human-input-channel-test/{self._id_factory()}",
+        )
+
+    def send_message(self, candidate: ResendCandidate, *, to: str, subject: str, html: str) -> None:
+        """Send one rendered notification using only the supplied channel credentials."""
+
+        self._send_message(
+            candidate,
+            to=to,
+            subject=subject,
+            html=html,
+            idempotency_key=f"human-input-message/{self._id_factory()}",
+        )
+
+    def _send_message(
+        self, candidate: ResendCandidate, *, to: str, subject: str, html: str, idempotency_key: str
+    ) -> None:
         sender = f"{candidate.sender_name} <{candidate.sender_email}>"
         body = self._request(
             "/emails",
-            candidate.api_key,
+            candidate.credentials.api_key,
             json={
                 "from": sender,
-                "to": [_TEST_RECIPIENT],
-                "subject": _TEST_SUBJECT,
-                "html": _TEST_HTML,
+                "to": [to],
+                "subject": subject,
+                "html": html,
             },
-            idempotency_key=f"human-input-channel-test/{self._id_factory()}",
+            idempotency_key=idempotency_key,
         )
         message_id = body.get("id")
         if not isinstance(message_id, str) or not message_id.strip():
@@ -112,23 +141,42 @@ class ResendProviderGateway:
 
     @staticmethod
     def _raise_provider_error(status_code: int, body: Mapping[str, Any]) -> Never:
-        error_name = body.get("name")
-        safe_name = error_name if isinstance(error_name, str) else None
+        try:
+            safe_name = _ResendErrorResponse.model_validate(body).name
+        except ValidationError:
+            safe_name = None
+        provider_error_code = safe_name
         if safe_name in {"missing_api_key", "invalid_api_key", "restricted_api_key"}:
-            raise EmailProviderValidationError("invalid_api_key")
+            raise EmailProviderValidationError(
+                "invalid_api_key", provider_error_code=provider_error_code, http_status=status_code
+            )
         if safe_name == "invalid_from_address":
-            raise EmailProviderValidationError("invalid_sender")
+            raise EmailProviderValidationError(
+                "invalid_sender", provider_error_code=provider_error_code, http_status=status_code
+            )
         if safe_name == "validation_error":
-            raise EmailProviderValidationError("provider_validation_failed")
+            raise EmailProviderValidationError(
+                "provider_validation_failed", provider_error_code=provider_error_code, http_status=status_code
+            )
         if safe_name in {"daily_quota_exceeded", "monthly_quota_exceeded"}:
-            raise EmailProviderOperationError("provider_quota_exhausted")
+            raise EmailProviderOperationError(
+                "provider_quota_exhausted", provider_error_code=provider_error_code, http_status=status_code
+            )
         if status_code == 429 or safe_name == "rate_limit_exceeded":
-            raise EmailProviderOperationError("provider_rate_limited")
+            raise EmailProviderOperationError(
+                "provider_rate_limited", provider_error_code=provider_error_code, http_status=status_code
+            )
         if status_code >= 500:
-            raise EmailProviderOperationError("provider_unavailable")
+            raise EmailProviderOperationError(
+                "provider_unavailable", provider_error_code=provider_error_code, http_status=status_code
+            )
         if status_code in {401, 403}:
-            raise EmailProviderValidationError("invalid_api_key")
-        raise EmailProviderValidationError("provider_rejected")
+            raise EmailProviderValidationError(
+                "invalid_api_key", provider_error_code=provider_error_code, http_status=status_code
+            )
+        raise EmailProviderValidationError(
+            "provider_rejected", provider_error_code=provider_error_code, http_status=status_code
+        )
 
 
 __all__ = [

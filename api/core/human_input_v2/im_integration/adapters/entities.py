@@ -19,9 +19,10 @@ CorrelationToken = NewType("CorrelationToken", str)
 
 
 class CredentialTestFailureKind(StrEnum):
-    """Credential-test distinctions required by configuration callers."""
+    """Provider failures; UNKNOWN is an unclassified provider error response."""
 
     AUTHENTICATION_REJECTED = "authentication_rejected"
+    PERMISSION_DENIED = "permission_denied"
     TENANT_ID_UNAVAILABLE = "tenant_id_unavailable"
     UNKNOWN = "UNKNOWN"
 
@@ -36,19 +37,42 @@ class CredentialTestSuccess:
 
 @dataclass(frozen=True, slots=True)
 class CredentialTestFailure:
-    """Safe credential-test failure without provider response material."""
+    """Provider rejection or confirmed credential limitation, not an execution error."""
 
     kind: CredentialTestFailureKind
     reason: str
+    provider_error_code: str | None = None
+    missing_permissions: tuple[str, ...] = ()
+    http_status: int | None = None
+
+
+class IMProviderError(Exception):
+    """A provider operation failed with a message suitable for configuration callers."""
+
+
+class CredentialTestTimeoutError(IMProviderError):
+    """A credential-test request timed out; the original error is its cause."""
+
+    def __init__(self) -> None:
+        super().__init__("The provider credential test request timed out.")
+
+
+@dataclass(frozen=True, slots=True)
+class Avatar:
+    """Downloaded provider image, independent of transport and credentials."""
+
+    mime_type: str
+    data: bytes
 
 
 @dataclass(frozen=True, slots=True)
 class DirectoryEntry:
-    """Minimal provider identity from one complete directory snapshot."""
+    """Provider identity and downloaded avatar from one directory snapshot."""
 
     provider_user_id: ProviderUserId
     display_name: str | None
     email: str | None
+    avatar: Avatar | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +149,8 @@ class WebhookRequest:
     headers: tuple[tuple[str, str], ...]
     body: bytes
     received_at: NaiveDatetime
+    # None when the transport cannot determine the request IP.
+    request_ip_address: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,11 +239,13 @@ class IMStreamStopError(Exception):
 
 __all__ = [
     "AuthenticatedIMEvent",
+    "Avatar",
     "CardAssessment",
     "CorrelationToken",
     "CredentialTestFailure",
     "CredentialTestFailureKind",
     "CredentialTestSuccess",
+    "CredentialTestTimeoutError",
     "Directory",
     "DirectoryEntry",
     "DirectoryReadFailure",
@@ -227,6 +255,7 @@ __all__ = [
     "IMCardEventDecodeResult",
     "IMCardEventDecodingError",
     "IMEventIngressKind",
+    "IMProviderError",
     "IMStreamStartError",
     "IMStreamStopError",
     "MessageAccepted",

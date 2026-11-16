@@ -9,35 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import hashlib
 import hmac
 import json
 import logging
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from string import punctuation
 from typing import ClassVar, Literal, Never, Protocol, override, runtime_checkable
 from urllib.parse import parse_qs, urlsplit
 
 import lark_oapi as lark
 from cryptography.hazmat.primitives import padding as symmetric_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from lark_oapi.api import contact, im, tenant
+from lark_oapi.api import auth, contact, im, tenant
 from lark_oapi.channel import FeishuChannel, TransportConfig
+from lark_oapi.core.exception import AccessTokenException, ObtainAccessTokenException
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTrigger, P2CardActionTriggerResponse
 from lark_oapi.ws import client as sdk_ws_client_module
-from markdown_it import MarkdownIt
-from markdown_it.token import Token
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, field_validator
+from pydantic import AliasPath, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError, field_validator
+from requests.exceptions import Timeout as RequestsTimeout
 from websockets.asyncio.client import ClientConnection
 
 from core.human_input import ButtonStyle
 from core.human_input_v2.entities import IMProvider
+from core.human_input_v2.im_integration.adapters.avatar import read_avatars
 from core.human_input_v2.im_integration.adapters.credentials import (
     FeishuCredentials,
     LarkCredentials,
@@ -50,6 +51,7 @@ from core.human_input_v2.im_integration.adapters.entities import (
     CredentialTestFailure,
     CredentialTestFailureKind,
     CredentialTestSuccess,
+    CredentialTestTimeoutError,
     Directory,
     DirectoryEntry,
     DirectoryReadFailure,
@@ -59,6 +61,7 @@ from core.human_input_v2.im_integration.adapters.entities import (
     IMCardEventDecodeResult,
     IMCardEventDecodingError,
     IMEventIngressKind,
+    IMProviderError,
     IMStreamStartError,
     IMStreamStopError,
     MessageAccepted,
@@ -106,7 +109,7 @@ class _DepartmentIdentity:
 
 
 _ROOT_DEPARTMENT = _DepartmentIdentity("0", "department_id")
-_AUTHENTICATION_REJECTED_CODES = frozenset((99991663, 99991664, 99991665))
+_AUTHENTICATION_REJECTED_CODES = frozenset((10014, 99991663, 99991664, 99991665))
 _STALE_MESSAGE_CODES = frozenset((230001, 230011, 230020))
 _JSON_RESPONSE_HEADERS = (("Content-Type", "application/json"),)
 _STREAM_READY_TIMEOUT_SECONDS = 30.0
@@ -115,7 +118,6 @@ _MILLISECONDS_PER_SECOND = 1_000
 _MICROSECONDS_PER_SECOND = 1_000_000
 _MILLISECOND_TIMESTAMP_DIGITS = 13
 _MICROSECOND_TIMESTAMP_DIGITS = 16
-_COMMONMARK_PARSER = MarkdownIt("commonmark", {"html": False})
 
 
 def _log_safe_error(message: str, *, extra: Mapping[str, object] | None = None) -> None:
@@ -125,13 +127,26 @@ def _log_safe_error(message: str, *, extra: Mapping[str, object] | None = None) 
 
 
 class _SDKGateway(Protocol):
-    """Narrow synchronous boundary over official generated SDK resources."""
+    """Narrow synchronous boundary over official generated SDK resources.
 
-    def query_tenant(self) -> Mapping[str, object]: ...
+    Omitting request options delegates authentication to the SDK token lifecycle.
+    """
 
-    def list_scope(self, page_token: str | None) -> Mapping[str, object]: ...
+    def request_tenant_access_token(self) -> str: ...
 
-    def list_departments(self, department: _DepartmentIdentity, page_token: str | None) -> Mapping[str, object]: ...
+    def query_tenant(self, *, request_option: lark.RequestOption | None = None) -> Mapping[str, object]: ...
+
+    def list_scope(
+        self, page_token: str | None, *, request_option: lark.RequestOption | None = None
+    ) -> Mapping[str, object]: ...
+
+    def list_departments(
+        self,
+        department: _DepartmentIdentity,
+        page_token: str | None,
+        *,
+        request_option: lark.RequestOption | None = None,
+    ) -> Mapping[str, object]: ...
 
     def list_users(self, department: _DepartmentIdentity, page_token: str | None) -> Mapping[str, object]: ...
 
@@ -166,6 +181,7 @@ class _OfficialSDKGateway(_SDKGateway):
             .app_id(credentials.app_id)
             .app_secret(credentials.app_secret)
             .domain(domain)
+            .enable_set_token(True)
             .log_level(lark.LogLevel.ERROR)
             .build()
         )
@@ -177,14 +193,46 @@ class _OfficialSDKGateway(_SDKGateway):
         self._tenant_service = tenant_service
         self._contact_service = contact_service
         self._im_service = im_service
+        self._client = client
+        self._credentials = credentials
 
     @override
-    def query_tenant(self) -> Mapping[str, object]:
+    def request_tenant_access_token(self) -> str:
+        """Authenticate submitted credentials without consulting the SDK token cache."""
+
+        auth_service = self._client.auth
+        if auth_service is None:
+            raise IMProviderError("official SDK client did not initialize authentication")
+        body = (
+            auth.v3.InternalTenantAccessTokenRequestBody.builder()
+            .app_id(self._credentials.app_id)
+            .app_secret(self._credentials.app_secret)
+            .build()
+        )
+        request = auth.v3.InternalTenantAccessTokenRequest.builder().request_body(body).build()
+        response = auth_service.v3.tenant_access_token.internal(request)
+        raw = response.raw
+        if raw is None or raw.content is None or raw.status_code is None:
+            raise IMProviderError("provider token response is empty")
+        token_response = _TenantAccessTokenResponse.model_validate_json(raw.content)
+        if token_response.code is None:
+            raise IMProviderError("provider token response did not confirm authentication")
+        if token_response.code != 0:
+            raise AccessTokenException(raw.status_code, token_response.code, "credential test rejected", "")
+        if token_response.tenant_access_token is None:
+            raise IMProviderError("provider token response did not provide an access token")
+
+        return token_response.tenant_access_token
+
+    @override
+    def query_tenant(self, *, request_option: lark.RequestOption | None = None) -> Mapping[str, object]:
         request = tenant.v2.QueryTenantRequest.builder().build()
-        return _sdk_response_mapping(self._tenant_service.v2.tenant.query(request))
+        return _sdk_response_mapping(self._tenant_service.v2.tenant.query(request, request_option))
 
     @override
-    def list_scope(self, page_token: str | None) -> Mapping[str, object]:
+    def list_scope(
+        self, page_token: str | None, *, request_option: lark.RequestOption | None = None
+    ) -> Mapping[str, object]:
         builder = (
             contact.v3.ListScopeRequest.builder()
             .page_size(_DIRECTORY_PAGE_SIZE)
@@ -193,10 +241,16 @@ class _OfficialSDKGateway(_SDKGateway):
         )
         if page_token is not None:
             builder = builder.page_token(page_token)
-        return _sdk_response_mapping(self._contact_service.v3.scope.list(builder.build()))
+        return _sdk_response_mapping(self._contact_service.v3.scope.list(builder.build(), request_option))
 
     @override
-    def list_departments(self, department: _DepartmentIdentity, page_token: str | None) -> Mapping[str, object]:
+    def list_departments(
+        self,
+        department: _DepartmentIdentity,
+        page_token: str | None,
+        *,
+        request_option: lark.RequestOption | None = None,
+    ) -> Mapping[str, object]:
         builder = (
             contact.v3.ChildrenDepartmentRequest.builder()
             .department_id_type(department.id_type)
@@ -208,7 +262,7 @@ class _OfficialSDKGateway(_SDKGateway):
             builder = builder.page_token(page_token)
         request = builder.build()
         request.paths["department_id"] = department.value
-        return _sdk_response_mapping(self._contact_service.v3.department.children(request))
+        return _sdk_response_mapping(self._contact_service.v3.department.children(request, request_option))
 
     @override
     def list_users(self, department: _DepartmentIdentity, page_token: str | None) -> Mapping[str, object]:
@@ -622,8 +676,60 @@ class _TenantData(_ExternalResponseModel):
     tenant: _Tenant
 
 
-class _TenantResponse(_ExternalResponseModel):
-    code: int
+class _PermissionViolation(_ExternalResponseModel):
+    type: str | None = None
+    subject: str
+
+
+class _PermissionErrorDetails(_ExternalResponseModel):
+    permission_violations: list[_PermissionViolation] = Field(default_factory=list)
+
+
+class _HTTPResponseMetadata(_ExternalResponseModel):
+    status_code: int | None = None
+
+
+class _CredentialResponse(_ExternalResponseModel):
+    code: int | None = None
+    error: JsonValue = None
+    raw: _HTTPResponseMetadata | None = None
+
+
+class _TenantAccessTokenResponse(_CredentialResponse):
+    tenant_access_token: str | None = Field(default=None, min_length=1, pattern=r"\S", repr=False)
+
+
+def _credential_rejection(response: _CredentialResponse, reason: str) -> CredentialTestFailure:
+    try:
+        details = _PermissionErrorDetails.model_validate(response.error)
+    except ValidationError:
+        missing_permissions = ()
+    else:
+        missing_permissions = tuple(
+            sorted(
+                {
+                    violation.subject
+                    for violation in details.permission_violations
+                    if violation.type == "action" and violation.subject
+                }
+            )
+        )
+    kind = CredentialTestFailureKind.UNKNOWN
+    if response.code in _AUTHENTICATION_REJECTED_CODES:
+        kind = CredentialTestFailureKind.AUTHENTICATION_REJECTED
+    elif missing_permissions:
+        kind = CredentialTestFailureKind.PERMISSION_DENIED
+    provider_error_code = str(response.code) if response.code is not None else None
+    return CredentialTestFailure(
+        kind,
+        reason,
+        provider_error_code,
+        missing_permissions,
+        http_status=response.raw.status_code if response.raw is not None else None,
+    )
+
+
+class _TenantResponse(_CredentialResponse):
     data: _TenantData | None = None
 
 
@@ -634,8 +740,7 @@ class _ScopeData(_ExternalResponseModel):
     page_token: str | None = Field(default=None, strict=True)
 
 
-class _ScopeResponse(_ExternalResponseModel):
-    code: int
+class _ScopeResponse(_CredentialResponse):
     data: _ScopeData | None = None
 
 
@@ -644,6 +749,14 @@ class _DirectoryUser(_ExternalResponseModel):
     name: str | None = None
     email: str | None = None
     enterprise_email: str | None = None
+    avatar_url: str | None = Field(default=None, validation_alias=AliasPath("avatar", "avatar_240"))
+
+    @field_validator("avatar_url")
+    @classmethod
+    def _normalize_avatar_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class _DirectoryDepartment(_ExternalResponseModel):
@@ -668,8 +781,7 @@ class _DepartmentPageData(_ExternalResponseModel):
     page_token: str | None = Field(default=None, strict=True)
 
 
-class _DepartmentPageResponse(_ExternalResponseModel):
-    code: int
+class _DepartmentPageResponse(_CredentialResponse):
     data: _DepartmentPageData | None = None
 
 
@@ -784,7 +896,8 @@ class _MSFeishuLarkCardCodec(IMCardEventDecoder):
         tag: Literal["button"]
         name: str = Field(min_length=1)
         value: _MSFeishuLarkCardCodec._ButtonValue
-        form_value: dict[str, JsonValue]
+        # Feishu/Lark omit form_value when the card has no input components.
+        form_value: dict[str, JsonValue] = Field(default_factory=dict)
 
         @field_validator("name")
         @classmethod
@@ -1088,7 +1201,7 @@ class _FeishuLarkDirectory(IMDirectory):
             return DirectoryReadFailure(f"{_provider_name(self._provider)} directory could not be read completely.")
 
     def _read_complete_directory(self) -> Directory:
-        entries: list[DirectoryEntry] = []
+        users: list[_DirectoryUser] = []
         seen_users: set[str] = set()
         seen_departments = {_ROOT_DEPARTMENT}
         pending_departments = deque((_ROOT_DEPARTMENT,))
@@ -1099,21 +1212,23 @@ class _FeishuLarkDirectory(IMDirectory):
                 if user.union_id in seen_users:
                     continue
                 seen_users.add(user.union_id)
-                entries.append(self._entry_from_user(user))
+                users.append(user)
             for child in self._read_child_departments(department):
                 if child in seen_departments:
                     continue
                 seen_departments.add(child)
                 pending_departments.append(child)
-        return Directory(tuple(entries))
-
-    @staticmethod
-    def _entry_from_user(user: _DirectoryUser) -> DirectoryEntry:
-        email = _optional_string(user.enterprise_email) or _optional_string(user.email)
-        return DirectoryEntry(
-            provider_user_id=ProviderUserId(user.union_id),
-            display_name=_optional_string(user.name),
-            email=email,
+        avatars = read_avatars([user.avatar_url for user in users])
+        return Directory(
+            tuple(
+                DirectoryEntry(
+                    provider_user_id=ProviderUserId(user.union_id),
+                    display_name=_optional_string(user.name),
+                    email=_optional_string(user.enterprise_email) or _optional_string(user.email),
+                    avatar=avatar,
+                )
+                for user, avatar in zip(users, avatars, strict=True)
+            )
         )
 
     def _read_users(self, department: _DepartmentIdentity) -> tuple[_DirectoryUser, ...]:
@@ -1161,12 +1276,21 @@ class _FeishuLarkMessaging(IMMessaging):
         self._provider = provider
 
     @override
-    def send_text(self, provider_user_id: ProviderUserId, body: str) -> MessageSendingResult:
+    def send_text(
+        self, provider_user_id: ProviderUserId, body: str, subject: str | None = None
+    ) -> MessageSendingResult:
         try:
-            plain_text = _commonmark_plain_text(body)
-            content = json.dumps({"text": plain_text}, ensure_ascii=False, separators=(",", ":"))
+            elements: list[dict[str, str]] = []
+            if subject:
+                escaped_subject = "".join(
+                    f"\\{character}" if character in punctuation else character for character in subject
+                )
+                elements.append({"tag": "markdown", "content": f"# {escaped_subject}"})
+            elements.append({"tag": "markdown", "content": body})
+            card = {"schema": "2.0", "body": {"elements": elements}}
+            content = json.dumps(card, ensure_ascii=False, separators=(",", ":"))
             response = _MessageResponse.model_validate(
-                self._gateway.create_message(str(provider_user_id), "text", content)
+                self._gateway.create_message(str(provider_user_id), "interactive", content)
             )
         except Exception:
             _log_safe_error(
@@ -1257,7 +1381,7 @@ class _FeishuLarkDynamicCardMessaging(IMDynamicCardMessaging):
     ) -> ReplacementError | None:
         try:
             decoded_locator = _FeishuLarkLocatorPayload.decode(str(locator))
-        except (ValueError, binascii.Error, ValidationError):
+        except ValueError:
             return ReplacementError(
                 ReplacementErrorKind.INVALID_REFERENCE,
                 f"The {_provider_name(self._provider)} message reference is invalid.",
@@ -1294,7 +1418,7 @@ class _FeishuLarkDynamicCardMessaging(IMDynamicCardMessaging):
 
 
 class _FeishuLarkWebhookHandler(IMWebhookHandler):
-    """Authenticated Webhook boundary safe for concurrent calls."""
+    """Concurrent webhook boundary honoring optional provider authentication."""
 
     def __init__(
         self,
@@ -1313,17 +1437,17 @@ class _FeishuLarkWebhookHandler(IMWebhookHandler):
     def handle(self, request: WebhookRequest) -> WebhookResponse:
         if request.method != "POST":
             return _webhook_response(405, {"code": 1})
-        authenticated = self._authenticate_and_decode(request)
-        if authenticated is None:
+        decoded_request = self._decode_request(request)
+        if decoded_request is None:
             return _webhook_response(401, {"code": 1})
-        decoded, encrypted, native_payload = authenticated
+        decoded, encrypted, native_payload = decoded_request
 
         if decoded.get("type") == "url_verification":
             try:
                 challenge = _WebhookChallenge.model_validate(decoded)
             except ValidationError:
                 return _webhook_response(400, {"code": 1})
-            if not self._challenge_is_authenticated(challenge.token, decrypted=encrypted):
+            if not self._challenge_matches_configuration(challenge.token, decrypted=encrypted):
                 return _webhook_response(401, {"code": 1})
             return _webhook_response(200, {"challenge": challenge.challenge})
 
@@ -1351,7 +1475,7 @@ class _FeishuLarkWebhookHandler(IMWebhookHandler):
             payload=native_payload,
         )
         try:
-            acceptance = self._consumer.accept(event)
+            acceptance = self._consumer.accept(event, request_ip_address=request.request_ip_address)
         except Exception:
             _log_safe_error(
                 "Feishu/Lark Webhook consumer failed",
@@ -1362,15 +1486,13 @@ class _FeishuLarkWebhookHandler(IMWebhookHandler):
             return _webhook_response(503, {"code": 1})
         return _webhook_response(200, {"code": 0})
 
-    def _authenticate_and_decode(
+    def _decode_request(
         self,
         request: WebhookRequest,
     ) -> tuple[dict[str, object], bool, str] | None:
         # Authentication must parse Provider JSON for challenge, token, signature,
         # and tenant checks. The separate native string is never reconstructed;
         # it is persisted exactly so only the codec normalizes card callback facts.
-        if self._verification_token is None and self._encrypt_key is None:
-            return None
         try:
             outer = _decode_json_object(request.body)
             encrypted = outer.get("encrypt")
@@ -1384,7 +1506,7 @@ class _FeishuLarkWebhookHandler(IMWebhookHandler):
                 plaintext = _decrypt_webhook_payload(envelope.encrypt, self._encrypt_key)
                 native_payload = plaintext.decode()
                 decoded = _decode_json_object(plaintext)
-        except (ValueError, ValidationError, UnicodeDecodeError, binascii.Error):
+        except ValueError:
             return None
         # The official SDK authenticates URL verification with the body token and requires signatures only for events.
         if decoded.get("type") == "url_verification":
@@ -1399,9 +1521,9 @@ class _FeishuLarkWebhookHandler(IMWebhookHandler):
             token is not None and hmac.compare_digest(token, self._verification_token)
         )
 
-    def _challenge_is_authenticated(self, token: str | None, *, decrypted: bool) -> bool:
+    def _challenge_matches_configuration(self, token: str | None, *, decrypted: bool) -> bool:
         if self._verification_token is None:
-            return decrypted
+            return decrypted or self._encrypt_key is None
         return token is not None and hmac.compare_digest(token, self._verification_token)
 
 
@@ -1592,56 +1714,74 @@ class _FeishuLarkIMProviderAdapter:
         return self._provider
 
     def test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure:
+        try:
+            return self._test_credentials()
+        except (AccessTokenException, ObtainAccessTokenException) as error:
+            return _credential_rejection(
+                _CredentialResponse(
+                    code=error.code,
+                    raw=_HTTPResponseMetadata(status_code=error.status_code)
+                    if isinstance(error, AccessTokenException)
+                    else None,
+                ),
+                f"{_provider_name(self._provider)} rejected the credential test.",
+            )
+        except (TimeoutError, RequestsTimeout) as error:
+            raise CredentialTestTimeoutError() from error
+
+    def _test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure:
         self._ensure_open()
-        try:
-            tenant_response = _TenantResponse.model_validate(self._gateway.query_tenant())
-        except Exception:
-            _log_safe_error("Feishu/Lark credential test failed", extra={"im_provider": self._provider.value})
-            return CredentialTestFailure(
-                CredentialTestFailureKind.UNKNOWN,
-                f"{_provider_name(self._provider)} credential testing could not be completed.",
+        access_token = self._gateway.request_tenant_access_token()
+        request_option = lark.RequestOption.builder().tenant_access_token(access_token).build()
+        tenant_payload = self._gateway.query_tenant(request_option=request_option)
+        tenant_envelope = _CredentialResponse.model_validate(tenant_payload)
+        if tenant_envelope.code != 0:
+            return _credential_rejection(
+                tenant_envelope, f"{_provider_name(self._provider)} rejected the credential test."
             )
-        if tenant_response.code != 0:
-            kind = (
-                CredentialTestFailureKind.AUTHENTICATION_REJECTED
-                if tenant_response.code in _AUTHENTICATION_REJECTED_CODES
-                else CredentialTestFailureKind.UNKNOWN
-            )
-            return CredentialTestFailure(kind, f"{_provider_name(self._provider)} rejected the credential test.")
+        tenant_response = _TenantResponse.model_validate(tenant_payload)
         if tenant_response.data is None or tenant_response.data.tenant.tenant_key is None:
-            return CredentialTestFailure(
-                CredentialTestFailureKind.TENANT_ID_UNAVAILABLE,
-                f"{_provider_name(self._provider)} did not provide a stable tenant identity.",
-            )
-        try:
-            self._validate_complete_scope()
-            self._validate_root_department_access()
-        except Exception:
-            return CredentialTestFailure(
-                CredentialTestFailureKind.UNKNOWN,
-                f"{_provider_name(self._provider)} baseline permissions could not be confirmed.",
-            )
+            raise IMProviderError(f"{_provider_name(self._provider)} did not provide a stable tenant identity.")
+        scope_failure = self._validate_complete_scope(request_option)
+        if scope_failure is not None:
+            return scope_failure
+        department_failure = self._validate_root_department_access(request_option)
+        if department_failure is not None:
+            return department_failure
         return CredentialTestSuccess(self._provider, tenant_response.data.tenant.tenant_key)
 
-    def _validate_complete_scope(self) -> None:
+    def _validate_complete_scope(self, request_option: lark.RequestOption) -> CredentialTestFailure | None:
         page_token: str | None = None
         seen_tokens: set[str] = set()
         while True:
-            response = _ScopeResponse.model_validate(self._gateway.list_scope(page_token))
-            if response.code != 0 or response.data is None:
-                raise ValueError("directory scope page was rejected")
+            scope_payload = self._gateway.list_scope(page_token, request_option=request_option)
+            scope_envelope = _CredentialResponse.model_validate(scope_payload)
+            if scope_envelope.code != 0:
+                return _credential_rejection(
+                    scope_envelope, f"{_provider_name(self._provider)} baseline permissions could not be confirmed."
+                )
+            response = _ScopeResponse.model_validate(scope_payload)
+            if response.data is None:
+                raise IMProviderError("directory scope page was rejected")
             page_token = _next_page_token(response.data.has_more, response.data.page_token, seen_tokens)
             if page_token is None:
-                return
+                return None
 
-    def _validate_root_department_access(self) -> None:
-        response = _DepartmentPageResponse.model_validate(self._gateway.list_departments(_ROOT_DEPARTMENT, None))
-        if response.code != 0 or response.data is None:
-            raise ValueError("root department access was rejected")
+    def _validate_root_department_access(self, request_option: lark.RequestOption) -> CredentialTestFailure | None:
+        department_payload = self._gateway.list_departments(_ROOT_DEPARTMENT, None, request_option=request_option)
+        department_envelope = _CredentialResponse.model_validate(department_payload)
+        if department_envelope.code != 0:
+            return _credential_rejection(
+                department_envelope, f"{_provider_name(self._provider)} baseline permissions could not be confirmed."
+            )
+        response = _DepartmentPageResponse.model_validate(department_payload)
+        if response.data is None:
+            raise IMProviderError("root department access was rejected")
         for department in response.data.items:
             if _department_identity(department) is None:
-                raise ValueError("root department response contains an invalid identity")
+                raise IMProviderError("root department response contains an invalid identity")
         _next_page_token(response.data.has_more, response.data.page_token, set())
+        return None
 
     @property
     def directory(self) -> IMDirectory:
@@ -1707,42 +1847,6 @@ def _query_tenant_id(gateway: _SDKGateway) -> str:
     if response.code != 0 or response.data is None or response.data.tenant.tenant_key is None:
         raise ValueError("stable tenant identity is unavailable")
     return response.data.tenant.tenant_key
-
-
-def _commonmark_plain_text(body: str) -> str:
-    parts: list[str] = []
-    for token in _COMMONMARK_PARSER.parse(body):
-        if token.type == "inline":
-            parts.extend(_commonmark_inline_plain_text(token.children or ()))
-        elif token.type in {"code_block", "fence"}:
-            parts.append(token.content)
-        elif token.type in {"heading_close", "list_item_close"} or (
-            token.type == "paragraph_close" and not token.hidden
-        ):
-            if parts and not parts[-1].endswith("\n"):
-                parts.append("\n")
-    return "".join(parts).rstrip("\n")
-
-
-def _commonmark_inline_plain_text(tokens: Sequence[Token]) -> list[str]:
-    parts: list[str] = []
-    links: list[tuple[int, str | None]] = []
-    for token in tokens:
-        if token.type in {"text", "code_inline"}:
-            parts.append(token.content)
-        elif token.type in {"softbreak", "hardbreak"}:
-            parts.append("\n")
-        elif token.type == "image":
-            parts.append(token.content)
-        elif token.type == "link_open":
-            href = token.attrGet("href")
-            links.append((len(parts), href if isinstance(href, str) else None))
-        elif token.type == "link_close" and links:
-            label_start, href = links.pop()
-            label = "".join(parts[label_start:])
-            if href and href != label:
-                parts.append(f" ({href})")
-    return parts
 
 
 def _valid_webhook_signature(request: WebhookRequest, encrypt_key: str) -> bytes | None:
@@ -1814,7 +1918,7 @@ def _next_page_token(has_more: bool, page_token: str | None, seen_tokens: set[st
     if not has_more:
         return None
     if page_token is None or not page_token.strip() or page_token in seen_tokens:
-        raise ValueError("invalid pagination")
+        raise IMProviderError("invalid pagination")
     seen_tokens.add(page_token)
     return page_token
 
@@ -1838,10 +1942,10 @@ def _department_identity(department: _DirectoryDepartment) -> _DepartmentIdentit
 def _sdk_response_mapping(response: object) -> Mapping[str, object]:
     serialized = lark.JSON.marshal(response)
     if serialized is None:
-        raise ValueError("SDK response is empty")
+        raise IMProviderError("SDK response is empty")
     decoded = json.loads(serialized)
     if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
-        raise ValueError("SDK response is not a JSON object")
+        raise IMProviderError("SDK response is not a JSON object")
     return decoded
 
 

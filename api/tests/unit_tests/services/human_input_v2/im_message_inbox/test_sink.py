@@ -15,10 +15,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters import AuthenticatedIMEvent, EventAcceptance, IMEventIngressKind
 from core.human_input_v2.im_message_inbox import IMInboxRecordId, InboxEventValidationError
-from core.human_input_v2.shared import IntegrationId
-from models.human_input_v2 import IMMessageInbox
-from repositories.human_input_v2.im_message_inbox.repository import SQLAlchemyIMMessageInboxRepository
+from models.human_input_v2 import IMMessageEvent
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 from services.human_input_v2.im_message_inbox.sink import IMMessageInboxSink
+from services.human_input_v2.im_message_inbox.storage import IMInboxStorage
 from services.human_input_v2.im_message_inbox.telemetry import IMInboxMetricKind
 
 _NOW = datetime(2026, 8, 2, 8, tzinfo=UTC)
@@ -92,16 +92,14 @@ def _event(
 
 
 def _sink(sqlite_engine: Engine) -> tuple[IMMessageInboxSink, sessionmaker[Session], _RecordingMetrics]:
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
     session_maker = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
     metrics = _RecordingMetrics()
     return (
         IMMessageInboxSink(
-            integration_id=IntegrationId("integration-1"),
+            channel_id=IMChannelId("channel-1"),
             expected_provider=IMProvider.FEISHU,
             expected_provider_tenant_id="tenant-1",
-            repository=SQLAlchemyIMMessageInboxRepository(session_maker),
+            repository=IMInboxStorage(session_maker),
             clock=lambda: _NOW,
             metrics=metrics,
         ),
@@ -115,7 +113,7 @@ def test_sink_commits_before_enqueuing_record_id(sqlite_engine: Engine, task_pub
 
     def observe_commit(record_id: IMInboxRecordId) -> None:
         with session_maker() as session:
-            assert session.get(IMMessageInbox, str(record_id)) is not None
+            assert session.get(IMMessageEvent, str(record_id)) is not None
 
     task_publisher.observer = observe_commit
 
@@ -132,7 +130,7 @@ def test_identified_redelivery_reenqueues_same_record_without_mutating_facts(
     sink, session_maker, metrics = _sink(sqlite_engine)
     assert sink.accept(_event()) is EventAcceptance.ACCEPTED
     with session_maker.begin() as session:
-        stored = session.scalar(sa.select(IMMessageInbox))
+        stored = session.scalar(sa.select(IMMessageEvent))
         assert stored is not None
         stored.processed_at = datetime(2026, 8, 2, 8, 1)
 
@@ -146,7 +144,7 @@ def test_identified_redelivery_reenqueues_same_record_without_mutating_facts(
     assert len(task_publisher.record_ids) == 2
     assert task_publisher.record_ids[0] == task_publisher.record_ids[1]
     with session_maker() as session:
-        records = list(session.scalars(sa.select(IMMessageInbox)))
+        records = list(session.scalars(sa.select(IMMessageEvent)))
         assert len(records) == 1
         assert records[0].processed_at == datetime(2026, 8, 2, 8, 1)
 
@@ -174,7 +172,7 @@ def test_enqueue_failure_rejects_identified_callback_and_redelivery_retries_same
     ]
     assert "must-not-log" not in caplog.text
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 1
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 1
 
 
 def test_enqueue_failure_for_unidentified_callback_creates_new_record_on_redelivery(
@@ -192,7 +190,7 @@ def test_enqueue_failure_for_unidentified_callback_creates_new_record_on_redeliv
     assert second_acceptance is EventAcceptance.ACCEPTED
     assert task_publisher.record_ids[0] != task_publisher.record_ids[1]
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 2
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 2
 
 
 def test_sink_rejects_conflicting_bound_provider_identity_without_insert(sqlite_engine: Engine) -> None:
@@ -208,21 +206,19 @@ def test_sink_rejects_conflicting_bound_provider_identity_without_insert(sqlite_
         (IMInboxMetricKind.ACCEPTANCE_FAILURE, IMProvider.FEISHU, "identity_conflict"),
     ]
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
 
 
 def test_sink_preserves_provider_metadata_and_payload(sqlite_engine: Engine) -> None:
     maximum_tenant_id = "t" * 128
     maximum_event_id = "e" * 128
     maximum_event_type = "y" * 128
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
     session_maker = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
     sink = IMMessageInboxSink(
-        integration_id=IntegrationId("integration-1"),
+        channel_id=IMChannelId("channel-1"),
         expected_provider=IMProvider.FEISHU,
         expected_provider_tenant_id=maximum_tenant_id,
-        repository=SQLAlchemyIMMessageInboxRepository(session_maker),
+        repository=IMInboxStorage(session_maker),
         clock=lambda: _NOW,
         metrics=_RecordingMetrics(),
     )
@@ -233,10 +229,10 @@ def test_sink_preserves_provider_metadata_and_payload(sqlite_engine: Engine) -> 
 
     assert acceptance is EventAcceptance.ACCEPTED
     with session_maker() as session:
-        stored = session.scalar(sa.select(IMMessageInbox))
+        stored = session.scalar(sa.select(IMMessageEvent))
         assert stored is not None
-        assert stored.provider_tenant_id == maximum_tenant_id
-        assert stored.provider_event_id == maximum_event_id
+        assert stored.tenant_id == maximum_tenant_id
+        assert stored.event_id == maximum_event_id
         assert stored.provider_event_type == maximum_event_type
         assert stored.payload == _PAYLOAD
 
@@ -248,22 +244,20 @@ def test_sink_canonicalizes_blank_event_id_before_validation(sqlite_engine: Engi
 
     assert acceptance is EventAcceptance.ACCEPTED
     with session_maker() as session:
-        stored = session.scalar(sa.select(IMMessageInbox))
+        stored = session.scalar(sa.select(IMMessageEvent))
         assert stored is not None
-        assert stored.provider_event_id is None
+        assert stored.event_id is None
 
 
 def test_sink_rejects_oversized_bound_provider_identity(sqlite_engine: Engine) -> None:
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
     session_maker = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
 
     with pytest.raises(InboxEventValidationError, match="provider tenant id"):
         IMMessageInboxSink(
-            integration_id=IntegrationId("integration-1"),
+            channel_id=IMChannelId("channel-1"),
             expected_provider=IMProvider.FEISHU,
             expected_provider_tenant_id="t" * 129,
-            repository=SQLAlchemyIMMessageInboxRepository(session_maker),
+            repository=IMInboxStorage(session_maker),
             clock=lambda: _NOW,
             metrics=_RecordingMetrics(),
         )
@@ -285,4 +279,16 @@ def test_sink_returns_not_accepted_when_database_commit_fails(
     assert metrics.events == [(IMInboxMetricKind.ACCEPTANCE_FAILURE, IMProvider.FEISHU, "persistence_failure")]
     assert "must-not-log" not in caplog.text
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
+
+
+def test_request_ip_is_forwarded_for_each_accepted_event(sqlite_engine: Engine) -> None:
+    sink, sessions, _ = _sink(sqlite_engine)
+    assert sink.accept(_event(event_id="event-1"), request_ip_address="192.0.2.22") is EventAcceptance.ACCEPTED
+    assert sink.accept(_event(event_id="event-2")) is EventAcceptance.ACCEPTED
+    with sessions() as session:
+        records = session.scalars(sa.select(IMMessageEvent)).all()
+        assert {record.event_id: record.request_ip_address for record in records} == {
+            "event-1": "192.0.2.22",
+            "event-2": None,
+        }

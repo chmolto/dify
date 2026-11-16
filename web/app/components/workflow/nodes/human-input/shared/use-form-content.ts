@@ -1,6 +1,6 @@
 import type { FormInputItem, HumanInputSharedNodeType } from './types'
 import { produce } from 'immer'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useLayoutEffect, useRef, useState } from 'react'
 import { useWorkflow } from '@/app/components/workflow/hooks/use-workflow'
 import useNodeCrud from '../../_base/hooks/use-node-crud'
 
@@ -10,29 +10,29 @@ const useHumanInputFormContent = <T extends HumanInputSharedNodeType>(id: string
   const { handleOutVarRenameChange } = useWorkflow()
   const inputsRef = useRef(inputs)
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     inputsRef.current = inputs
   }, [inputs])
 
   const handleFormContentChange = useCallback(
     (value: string) => {
       setInputs({
-        ...inputs,
+        ...inputsRef.current,
         form_content: value,
       })
     },
-    [inputs, setInputs],
+    [setInputs],
   )
 
   const handleFormInputsChange = useCallback(
     (formInputs: FormInputItem[]) => {
       setInputs({
-        ...inputs,
+        ...inputsRef.current,
         inputs: formInputs,
       })
       setEditorKey((editorKey) => editorKey + 1)
     },
-    [inputs, setInputs],
+    [setInputs],
   )
 
   const handleFormInputItemRename = useCallback(

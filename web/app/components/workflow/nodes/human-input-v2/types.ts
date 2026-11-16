@@ -2,23 +2,27 @@ import type { HumanInputSharedNodeType } from '../human-input/shared/types'
 import type { CommonNodeType, ValueSelector } from '@/app/components/workflow/types'
 import { BlockEnum } from '@/app/components/workflow/types'
 
-export type ContactRecipient = {
+type ContactRecipient = {
   type: 'contact'
   contact_id: string
 }
 
-export type DynamicEmailRecipient = {
+type DynamicEmailRecipient = {
   type: 'dynamic_email'
   selector: ValueSelector
 }
 
-export type OnetimeEmailRecipient = {
+type OnetimeEmailRecipient = {
   type: 'onetime_email'
   email: string
 }
 
-export type InitiatorRecipient = {
+type InitiatorRecipient = {
   type: 'initiator'
+}
+
+type AllWorkspaceContactsRecipient = {
+  type: 'all_workspace_contacts'
 }
 
 export type HumanInputV2Recipient =
@@ -26,10 +30,12 @@ export type HumanInputV2Recipient =
   | DynamicEmailRecipient
   | OnetimeEmailRecipient
   | InitiatorRecipient
+  | AllWorkspaceContactsRecipient
 
 export const HUMAN_INPUT_V2_DEBUG_CHANNELS = [
   'email',
   'feishu',
+  'lark',
   'slack',
   'ding_talk',
   'ms_teams',
@@ -49,7 +55,7 @@ export type HumanInputV2DebugMode = {
 }
 
 export type HumanInputV2NodeType = HumanInputSharedNodeType & {
-  type: BlockEnum.HumanInput
+  type: typeof BlockEnum.HumanInput
   version: '2'
   recipients_spec: HumanInputV2Recipient[]
   message_template: HumanInputV2MessageTemplate

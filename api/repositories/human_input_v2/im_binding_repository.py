@@ -21,7 +21,7 @@ class IMBindingKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class IMBinding:
-    """Current owner-free Contact-to-IM-identity Binding."""
+    """Current owner-free Contact-to-IM-identity Binding, immutable for its ID."""
 
     id: IMBindingId
     kind: IMBindingKind
@@ -59,6 +59,10 @@ class IMBindingRepository(Protocol):
         """Return a default Binding current in the bound Channel, if present."""
         ...
 
+    def get_default_for_contact(self, contact_id: ContactId) -> IMBinding | None:
+        """Return the Contact's default Binding in the bound Channel, ignoring overrides."""
+        ...
+
     def list_all(self) -> tuple[IMBinding, ...]:
         """Return all default Bindings in the bound Channel."""
         ...
@@ -69,20 +73,24 @@ class IMBindingRepository(Protocol):
         *,
         bound_by_account_id: AccountId | None,
     ) -> IMBinding:
-        """Create an idempotent default Binding in the bound Channel."""
+        """Create an idempotent default Binding; reject conflicting assignments."""
         ...
 
     def replace(
         self,
-        binding_id: IMBindingId,
+        assignment: IMBindingAssignment,
         *,
-        expected_identity_id: IMIdentityId,
-        next_identity_id: IMIdentityId,
         bound_by_account_id: AccountId | None,
-        updated_at: NaiveDatetime,
-        # TODO(QuantumGhost): The API seems weird
-    ) -> IMBinding | None:
-        """Replace one exact default Binding, or return no value when stale."""
+    ) -> IMBinding:
+        """Manually reassign both default Binding endpoints in the bound Channel.
+
+        Preserve identical assignments, including ID, timestamps, and actor metadata.
+        Otherwise delete the Contact's old default and the Identity's old default,
+        if present, then create the requested assignment with a new Binding ID.
+        Never modify workspace overrides. Concurrent endpoint changes raise
+        IMBindingConflictError. The caller owns the transaction and must roll back
+        all deletions and creation on failure.
+        """
         ...
 
     def delete(
@@ -101,7 +109,11 @@ class IMBindingRepository(Protocol):
         *,
         bound_by_account_id: AccountId | None,
     ) -> IMBinding:
-        """Create or update one target workspace override."""
+        """Create or replace one target workspace override with a new Binding ID.
+
+        Preserve identical assignments, including timestamps and actor metadata.
+        The caller owns the transaction covering deletion and creation.
+        """
         ...
 
     def reset_workspace_override(

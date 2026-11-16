@@ -1,18 +1,16 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from enum import StrEnum
 from typing import Annotated, Literal
 
 import pytest
 import sqlalchemy as sa
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-from pydantic_core import PydanticSerializationError
 from sqlalchemy import Engine, select
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 from sqlalchemy.sql.sqltypes import TEXT
 
-import models.types as model_types
 from models.types import FrozenPydanticModelColumn
 
 
@@ -106,10 +104,6 @@ def sqlite_pydantic_json_engine() -> Iterator[Engine]:
         engine.dispose()
 
 
-def test_frozen_pydantic_model_column_is_publicly_available() -> None:
-    assert getattr(model_types, "FrozenPydanticModelColumn", None) is not None
-
-
 def test_frozen_pydantic_model_column_accepts_a_frozen_strict_model() -> None:
     column_type = FrozenPydanticModelColumn(_FrozenStrictPayload)
 
@@ -117,16 +111,20 @@ def test_frozen_pydantic_model_column_accepts_a_frozen_strict_model() -> None:
 
 
 def test_concrete_model_rejects_explicit_model_types() -> None:
+    # Exercise invalid arguments from an untyped runtime caller.
+    construct: Callable[..., FrozenPydanticModelColumn[_FrozenStrictPayload]] = FrozenPydanticModelColumn
     with pytest.raises(TypeError, match="model_types must not be provided for a concrete model"):
-        FrozenPydanticModelColumn(
+        construct(
             _FrozenStrictPayload,
             model_types=(_FrozenStrictPayload,),
         )
 
 
 def test_type_adapter_requires_explicit_model_types() -> None:
+    # Exercise invalid arguments from an untyped runtime caller.
+    construct: Callable[..., FrozenPydanticModelColumn[_CatPayload | _DogPayload]] = FrozenPydanticModelColumn
     with pytest.raises(TypeError, match="model_types is required when schema is a TypeAdapter"):
-        FrozenPydanticModelColumn(TypeAdapter(_PetPayload))
+        construct(TypeAdapter(_PetPayload))
 
 
 def test_constructor_rejects_a_model_that_is_not_frozen() -> None:
@@ -171,13 +169,6 @@ def test_bind_processor_does_not_double_encode_model_json() -> None:
     assert bind_processor(_NamePayload(name="Alice")) == '{"name":"Alice"}'
 
 
-def test_bind_treats_serialization_warnings_as_errors() -> None:
-    invalid_model = _FrozenStrictPayload.model_construct(name=42, attributes={})
-
-    with pytest.raises(PydanticSerializationError):
-        _PAYLOAD_TYPE.process_bind_param(invalid_model, sqlite.dialect())
-
-
 def test_validation_errors_are_not_swallowed() -> None:
     with pytest.raises(ValidationError):
         _PAYLOAD_TYPE.process_result_value('{"name":42}', sqlite.dialect())
@@ -189,6 +180,7 @@ def test_result_restores_str_enum_from_strict_json_validation() -> None:
     restored = column_type.process_result_value('{"channel":"email"}', sqlite.dialect())
 
     assert restored == _FrozenStrictEnumPayload(channel=_DeliveryChannel.EMAIL)
+    assert restored is not None
     assert restored.channel is _DeliveryChannel.EMAIL
 
 

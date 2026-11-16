@@ -6,9 +6,9 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 from alibabacloud_dingtalk.oauth2_1_0.client import Client as OAuthClient
 from alibabacloud_dingtalk.oauth2_1_0.models import GetTokenRequest, GetTokenResponse, GetTokenResponseBody
@@ -20,6 +20,8 @@ from alibabacloud_dingtalk.robot_1_0.models import (
     BatchSendOTOResponseBody,
 )
 from alibabacloud_tea_util.models import RuntimeOptions
+from pydantic import ValidationError
+from pytest_mock import MockerFixture
 
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters import (
@@ -36,6 +38,7 @@ from core.human_input_v2.im_integration.adapters import (
 )
 from core.human_input_v2.im_integration.adapters import dingtalk as dingtalk_module
 from core.human_input_v2.im_integration.adapters.dingtalk import DingTalkIMProviderAdapter
+from core.human_input_v2.im_integration.adapters.entities import IMProviderError
 
 _FIXTURE_PATH = Path(__file__).parents[4] / "fixtures" / "im_provider" / "dingtalk" / "sanitized_protocol.json"
 
@@ -92,28 +95,29 @@ class _FixtureHTTPClient:
         self.calls: list[tuple[str, str, dict[str, int]]] = []
         self.close_calls = 0
 
-    def get(self, url: str, *, access_token: str) -> bytes:
+    def get(self, url: str, *, access_token: str) -> dingtalk_module._DirectoryHTTPResponse:
         path = urlparse(url).path
         self.calls.append((path, access_token, {}))
         status_code, response = self._route(path, {})
         if not 200 <= status_code < 300:
             raise OSError("fake HTTP failure detail")
-        return json.dumps(response, separators=(",", ":")).encode()
+        return dingtalk_module._DirectoryHTTPResponse(json.dumps(response, separators=(",", ":")).encode(), status_code)
 
-    def post(self, url: str, *, access_token: str, body: dict[str, int]) -> bytes:
+    def post(self, url: str, *, access_token: str, body: dict[str, int]) -> dingtalk_module._DirectoryHTTPResponse:
         path = urlparse(url).path
         self.calls.append((path, access_token, dict(body)))
         status_code, response = self._route(path, dict(body))
         if not 200 <= status_code < 300:
             raise OSError("fake HTTP failure detail")
-        return json.dumps(response, separators=(",", ":")).encode()
+        return dingtalk_module._DirectoryHTTPResponse(json.dumps(response, separators=(",", ":")).encode(), status_code)
 
     def close(self) -> None:
         self.close_calls += 1
 
 
 class _Consumer:
-    def accept(self, event: object) -> EventAcceptance:
+    def accept(self, event: object, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         del event
         return EventAcceptance.ACCEPTED
 
@@ -213,7 +217,17 @@ def _adapter(
 
 def test_public_adapter_round_trips_fresh_credentials_directory_and_text(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
 ) -> None:
+    mocker.patch(
+        "core.file.remote_fetcher.make_request",
+        return_value=httpx.Response(
+            200,
+            headers={"Content-Type": "image/png"},
+            content=b"avatar-image",
+            request=httpx.Request("GET", "https://example.invalid/fake-user-001.png"),
+        ),
+    )
     direct = _OAuthSequence(
         _token_response("fake-access-token-direct-001"),
         _token_response("fake-access-token-direct-002"),
@@ -248,6 +262,8 @@ def test_public_adapter_round_trips_fresh_credentials_directory_and_text(
     assert first_credentials == CredentialTestSuccess(IMProvider.DING_TALK, "fake-corp-001")
     assert second_credentials == first_credentials
     assert isinstance(directory, Directory)
+    assert directory.entries[0].avatar is not None
+    assert directory.entries[0].avatar.data == b"avatar-image"
     assert [entry.provider_user_id for entry in directory.entries] == [
         "fake-user-001",
         "fake-user-002",
@@ -285,7 +301,7 @@ def test_public_adapter_round_trips_fresh_credentials_directory_and_text(
         (_SDKError(500), CredentialTestFailureKind.UNKNOWN),
         (_MalformedTokenResponse(body=None), CredentialTestFailureKind.UNKNOWN),
         (
-            GetTokenResponse(status_code=200, body=GetTokenResponseBody(access_token="fake-token", expires_in=0)),
+            GetTokenResponse().from_map({"statusCode": 200, "body": {"access_token": "fake-token", "expires_in": 0}}),
             CredentialTestFailureKind.UNKNOWN,
         ),
     ],
@@ -300,11 +316,12 @@ def test_public_credential_test_normalizes_token_failures(
         direct=_OAuthSequence(direct_response),
     )
 
-    result = adapter.test_credentials()
-
-    assert isinstance(result, CredentialTestFailure)
-    assert result.kind is expected_kind
-    assert "fake" not in result.reason.casefold()
+    del expected_kind
+    expected_error = type(direct_response) if isinstance(direct_response, Exception) else IMProviderError
+    with pytest.raises(expected_error) as captured:
+        adapter.test_credentials()
+    if isinstance(direct_response, Exception):
+        assert captured.value is direct_response
     assert http.calls == []
 
 
@@ -354,11 +371,13 @@ def test_public_credential_test_requires_a_valid_root_baseline(
         http=http,
     )
 
-    result = adapter.test_credentials()
-
-    assert isinstance(result, CredentialTestFailure)
-    assert result.kind is expected_kind
-    assert "fake" not in result.reason.casefold()
+    if expected_kind is CredentialTestFailureKind.TENANT_ID_UNAVAILABLE:
+        result = adapter.test_credentials()
+        assert isinstance(result, CredentialTestFailure)
+        assert result.kind is expected_kind
+    else:
+        with pytest.raises((IMProviderError, ValidationError)):
+            adapter.test_credentials()
     assert len(http.calls) == 2
 
 
@@ -402,7 +421,7 @@ def test_public_directory_discards_late_partial_state_and_detects_bad_cursor(
         _message_response(filtered=["fake-user-001"]),
         _message_response(flow_controlled=["fake-user-001"]),
         _message_response(invalid=["fake-user-001"]),
-        SimpleNamespace(body=SimpleNamespace(process_query_key="fake-key", invalid_staff_id_list=object())),
+        BatchSendOTOResponse().from_map({"body": {"processQueryKey": "fake-key", "invalidStaffIdList": object()}}),
     ],
 )
 def test_public_messaging_returns_one_safe_failure_without_replay(

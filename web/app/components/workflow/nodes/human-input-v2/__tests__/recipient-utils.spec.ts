@@ -1,12 +1,12 @@
 import type { HumanInputV2Recipient } from '../types'
 import {
   addRecipient,
-  createRecipientDraft,
   deriveRecipientSummary,
+  findConflictingContact,
   getRecipientCanonicalKey,
   getRecipientValidationError,
   hasDuplicateRecipients,
-  removeRecipient,
+  replaceContactRecipient,
   updateRecipient,
 } from '../recipient-utils'
 
@@ -17,19 +17,6 @@ describe('Human Input v2 recipient utilities', () => {
     { type: 'dynamic_email', selector: ['start', 'email'] },
     { type: 'onetime_email', email: 'Owner@Example.com' },
   ]
-
-  it('constructs exact empty drafts for every recipient discriminator', () => {
-    expect(
-      (['contact', 'dynamic_email', 'onetime_email', 'initiator'] as const).map(
-        createRecipientDraft,
-      ),
-    ).toEqual([
-      { type: 'contact', contact_id: '' },
-      { type: 'dynamic_email', selector: [] },
-      { type: 'onetime_email', email: '' },
-      { type: 'initiator' },
-    ])
-  })
 
   it('validates every recipient union and derives canonical duplicate keys', () => {
     expect(getRecipientValidationError({ type: 'contact', contact_id: '' })).toBe(
@@ -66,12 +53,33 @@ describe('Human Input v2 recipient utilities', () => {
     expect(updateRecipient(added, 1, { type: 'contact', contact_id: 'contact-amanda' })[0]).toBe(
       recipients[0],
     )
-    expect(removeRecipient(added, 2)).toEqual([
-      recipients[0],
-      recipients[1],
-      recipients[3],
-      added[4],
-    ])
+  })
+
+  it.each([
+    'john..doe@example.com',
+    '.john@example.com',
+    'john.@example.com',
+    'john@example..com',
+    'john@.example.com',
+    'john@example.com.',
+  ])('rejects malformed email dot segments consistently: %s', (email) => {
+    const recipient: HumanInputV2Recipient = { type: 'onetime_email', email }
+    const existing: HumanInputV2Recipient[] = [{ type: 'initiator' }]
+
+    expect(getRecipientValidationError(recipient)).toBe('email-invalid')
+    expect(getRecipientCanonicalKey(recipient)).toBeUndefined()
+    expect(addRecipient(existing, recipient)).toBe(existing)
+    expect(deriveRecipientSummary([recipient]).state).toBe('invalid')
+  })
+
+  it.each([
+    ' First.Last+qa@Example.com ',
+    'owner@review.example.com',
+    "o'connor@example.com",
+    'owner@xn--bcher-kva.de',
+    '用户@例子.公司',
+  ])('preserves supported email addresses: %s', (email) => {
+    expect(getRecipientValidationError({ type: 'onetime_email', email })).toBeUndefined()
   })
 
   it('detects imported duplicates without normalizing or deleting them', () => {
@@ -108,5 +116,66 @@ describe('Human Input v2 recipient utilities', () => {
     expect(
       deriveRecipientSummary([{ type: 'contact', contact_id: 'unresolved' }], labels).state,
     ).toBe('invalid')
+  })
+
+  it('keeps the whole-workspace selector distinct from the initiator and detects repeated imports', () => {
+    const allContacts: HumanInputV2Recipient = { type: 'all_workspace_contacts' }
+    const selected: HumanInputV2Recipient[] = [allContacts, { type: 'initiator' }]
+    expect(getRecipientValidationError(allContacts)).toBeUndefined()
+    expect(addRecipient(selected, allContacts)).toBe(selected)
+    expect(hasDuplicateRecipients(selected)).toBe(false)
+    expect(hasDuplicateRecipients([allContacts, allContacts])).toBe(true)
+    expect(deriveRecipientSummary([allContacts])).toMatchObject({
+      state: 'configured',
+      hasAllWorkspaceContacts: true,
+      hasInitiator: false,
+    })
+    expect(deriveRecipientSummary(selected)).toMatchObject({
+      state: 'configured',
+      hasAllWorkspaceContacts: true,
+      hasInitiator: true,
+    })
+  })
+
+  it('locks only other contacts with the same normalized email', () => {
+    const contacts = [
+      { id: 'alice', email: ' Alice@Example.com ' },
+      { id: 'alice-external', email: 'alice@example.com' },
+      { id: 'unknown', email: '' },
+    ]
+    const selected: HumanInputV2Recipient[] = [
+      { type: 'contact', contact_id: 'alice' },
+      { type: 'onetime_email', email: 'bob@example.com' },
+    ]
+
+    expect(findConflictingContact(selected, contacts[1]!, contacts)).toEqual(contacts[0])
+    expect(findConflictingContact(selected, contacts[0]!, contacts)).toBeUndefined()
+    expect(
+      findConflictingContact(selected, { id: 'bob', email: 'bob@example.com' }, contacts),
+    ).toBeUndefined()
+    expect(findConflictingContact(selected, contacts[2]!, contacts)).toBeUndefined()
+    expect(
+      findConflictingContact(selected, { id: 'missing', email: 'other@example.com' }, contacts),
+    ).toBeUndefined()
+  })
+
+  it('replaces the occupying contact in place without changing other recipient identities', () => {
+    const selected: HumanInputV2Recipient[] = [
+      { type: 'initiator' },
+      { type: 'contact', contact_id: 'alice' },
+      { type: 'onetime_email', email: 'alice@example.com' },
+      { type: 'contact', contact_id: 'bob' },
+    ]
+    const snapshot = structuredClone(selected)
+
+    expect(replaceContactRecipient(selected, 'alice', 'alice-external')).toEqual([
+      selected[0],
+      { type: 'contact', contact_id: 'alice-external' },
+      selected[2],
+      selected[3],
+    ])
+    expect(selected).toEqual(snapshot)
+    expect(replaceContactRecipient(selected, 'missing', 'alice-external')).toBe(selected)
+    expect(replaceContactRecipient(selected, 'alice', 'bob')).toBe(selected)
   })
 })

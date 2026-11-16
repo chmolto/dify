@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from core.workflow.nodes.knowledge_retrieval.retrieval import Source, SourceMetadata
 from models.dataset import Dataset
-from models.enums import AppStatus
 from models.model import App, AppMode
 from services.entities.knowledge_retrieval_inner import InnerKnowledgeRetrieveRequest
 from services.errors.knowledge_retrieval import (
@@ -17,6 +16,7 @@ from services.errors.knowledge_retrieval import (
     InnerKnowledgeRetrieveDatasetTenantMismatchError,
 )
 from services.knowledge_retrieval_inner_service import InnerKnowledgeRetrievalService
+from tests.helpers.unit.model_factories import make_app, make_dataset
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_TENANT_ID = "22222222-2222-2222-2222-222222222222"
@@ -27,22 +27,19 @@ DATASET_2_ID = "66666666-6666-6666-6666-666666666666"
 
 
 def _app(*, tenant_id: str = TENANT_ID) -> App:
-    return App(
-        id=APP_ID,
+    return make_app(
+        app_id=APP_ID,
         tenant_id=tenant_id,
-        name="Test App",
-        description="",
         mode=AppMode.WORKFLOW,
-        status=AppStatus.NORMAL,
+        icon_type=None,
         enable_site=False,
         enable_api=False,
-        max_active_requests=None,
     )
 
 
 def _dataset(*, dataset_id: str, tenant_id: str = TENANT_ID, enable_api: bool = True) -> Dataset:
-    return Dataset(
-        id=dataset_id,
+    return make_dataset(
+        dataset_id=dataset_id,
         tenant_id=tenant_id,
         name=f"Dataset {dataset_id[-1]}",
         description="",
@@ -57,8 +54,8 @@ def _persist_state(sqlite_session: Session, *models: App | Dataset) -> None:
     sqlite_session.expunge_all()
 
 
-def _build_request(**overrides):
-    payload = {
+def _build_request(**overrides: object) -> InnerKnowledgeRetrieveRequest:
+    payload: dict[str, object] = {
         "caller": {
             "tenant_id": TENANT_ID,
             "user_id": USER_ID,
@@ -119,9 +116,9 @@ class TestInnerKnowledgeRetrievalService:
     @patch("services.knowledge_retrieval_inner_service.DatasetRetrieval")
     def test_retrieve_maps_multiple_request_and_skips_enable_api_check(
         self,
-        mock_rag_cls,
+        mock_rag_cls: MagicMock,
         sqlite_session: Session,
-    ):
+    ) -> None:
         request = _build_request()
         _persist_state(
             sqlite_session,
@@ -179,7 +176,7 @@ class TestInnerKnowledgeRetrievalService:
 
     @pytest.mark.parametrize("sqlite_session", [(App, Dataset)], indirect=True)
     @patch("services.knowledge_retrieval_inner_service.DatasetRetrieval")
-    def test_retrieve_maps_single_request(self, mock_rag_cls, sqlite_session: Session):
+    def test_retrieve_maps_single_request(self, mock_rag_cls: MagicMock, sqlite_session: Session) -> None:
         request = _build_request(
             dataset_ids=[DATASET_1_ID],
             retrieval={
@@ -205,7 +202,7 @@ class TestInnerKnowledgeRetrievalService:
         _persist_state(sqlite_session, _app(), _dataset(dataset_id=DATASET_1_ID))
 
         rag = MagicMock()
-        rag.knowledge_retrieval.return_value = []
+        rag.knowledge_retrieval.return_value = list[object]()
         rag.llm_usage = {
             "prompt_tokens": 1,
             "completion_tokens": 2,
@@ -236,13 +233,13 @@ class TestInnerKnowledgeRetrievalService:
         assert sqlite_session.in_transaction()
 
     @pytest.mark.parametrize("sqlite_session", [(App, Dataset)], indirect=True)
-    def test_retrieve_raises_when_app_missing(self, sqlite_session: Session):
+    def test_retrieve_raises_when_app_missing(self, sqlite_session: Session) -> None:
         with pytest.raises(InnerKnowledgeRetrieveAppNotFoundError):
             InnerKnowledgeRetrievalService().retrieve(_build_request(), sqlite_session)
         assert sqlite_session.in_transaction()
 
     @pytest.mark.parametrize("sqlite_session", [(App, Dataset)], indirect=True)
-    def test_retrieve_raises_when_app_belongs_to_other_tenant(self, sqlite_session: Session):
+    def test_retrieve_raises_when_app_belongs_to_other_tenant(self, sqlite_session: Session) -> None:
         _persist_state(sqlite_session, _app(tenant_id=OTHER_TENANT_ID))
 
         with pytest.raises(InnerKnowledgeRetrieveAppTenantMismatchError):
@@ -250,7 +247,7 @@ class TestInnerKnowledgeRetrievalService:
         assert sqlite_session.in_transaction()
 
     @pytest.mark.parametrize("sqlite_session", [(App, Dataset)], indirect=True)
-    def test_retrieve_raises_when_dataset_missing(self, sqlite_session: Session):
+    def test_retrieve_raises_when_dataset_missing(self, sqlite_session: Session) -> None:
         _persist_state(sqlite_session, _app(), _dataset(dataset_id=DATASET_1_ID))
 
         with pytest.raises(InnerKnowledgeRetrieveDatasetNotFoundError):
@@ -258,7 +255,7 @@ class TestInnerKnowledgeRetrievalService:
         assert sqlite_session.in_transaction()
 
     @pytest.mark.parametrize("sqlite_session", [(App, Dataset)], indirect=True)
-    def test_retrieve_raises_when_dataset_belongs_to_other_tenant(self, sqlite_session: Session):
+    def test_retrieve_raises_when_dataset_belongs_to_other_tenant(self, sqlite_session: Session) -> None:
         _persist_state(
             sqlite_session,
             _app(),

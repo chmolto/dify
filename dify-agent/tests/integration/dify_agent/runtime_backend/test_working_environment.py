@@ -1,7 +1,9 @@
-"""Opt-in integration contracts for final Local and E2B working environments."""
+"""Opt-in integration contracts for final Local, E2B, and OpenShell working environments."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 import os
 import shlex
 import sys
@@ -20,7 +22,11 @@ from dify_agent.runtime_backend.e2b import (
     E2BHomeSnapshotBackend,
     E2BSDKControlPlane,
 )
-from dify_agent.runtime_backend.local import LocalExecutionBindingBackend
+from dify_agent.runtime_backend.local import LocalExecutionBindingBackend, LocalHomeSnapshotBackend
+from dify_agent.runtime_backend.openshell import (
+    OpenShellExecutionBindingBackend,
+    OpenShellSDKControlPlane,
+)
 from dify_agent.runtime.command_runner import execute_complete_with_commands
 
 pytestmark = pytest.mark.integration
@@ -110,6 +116,90 @@ async def test_local_two_agents_share_workspace_but_not_home() -> None:
                         destroy_workspace=index == len(allocations) - 1,
                     )
                 )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors and not primary_error:
+            raise cleanup_errors[0]
+
+
+@pytest.mark.anyio
+async def test_local_home_checkpoint_preserves_cross_directory_hard_links() -> None:
+    endpoint = _required_env("DIFY_AGENT_TEST_LOCAL_SHELLCTL_ENDPOINT", "real Local shellctl")
+    token = os.environ.get("DIFY_AGENT_TEST_LOCAL_SHELLCTL_AUTH_TOKEN", "")
+    marker = uuid.uuid4().hex
+    bindings = LocalExecutionBindingBackend(endpoint=endpoint, auth_token=token)
+    snapshots = LocalHomeSnapshotBackend(endpoint=endpoint, auth_token=token)
+    binding_spec = ExecutionBindingCreateSpec(
+        tenant_id="integration-tenant",
+        agent_id="integration-agent",
+        binding_id=f"source-{marker}",
+        workspace_id=f"source-{marker}",
+        existing_workspace_ref=None,
+    )
+    allocations = []
+    leases = []
+    checkpoint_ref: str | None = None
+    try:
+        source = await bindings.create_binding(binding_spec)
+        allocations.append(source)
+        source_lease = await bindings.acquire(source.binding_ref)
+        leases.append(source_lease)
+        source_inode = await _run(
+            source_lease,
+            "set -eu\nmkdir -p a b\nprintf hard-linked-home > a/file\nln a/file b/file\nstat -c '%d:%i' a/file",
+            cwd=source_lease.layout.home_dir,
+        )
+        await _run(source_lease, "printf workspace-only > workspace-marker", cwd=source_lease.layout.workspace_dir)
+        checkpoint_ref = await snapshots.create_from_runtime(
+            spec=HomeSnapshotCreateSpec(
+                tenant_id="integration-tenant", agent_id="integration-agent", home_snapshot_id=f"checkpoint-{marker}"
+            ),
+            source=source_lease,
+        )
+        restored = await bindings.create_binding(
+            replace(
+                binding_spec,
+                binding_id=f"restored-{marker}",
+                workspace_id=f"restored-{marker}",
+                home_snapshot_ref=checkpoint_ref,
+            )
+        )
+        allocations.append(restored)
+        restored_lease = await bindings.acquire(restored.binding_ref)
+        leases.append(restored_lease)
+        content, restored_inode = (
+            await _run(
+                restored_lease,
+                "set -eu\ntest a/file -ef b/file\ntest ! -e workspace-marker\n"
+                "cat a/file\nprintf '\n'\nstat -c '%d:%i' a/file",
+                cwd=restored_lease.layout.home_dir,
+            )
+        ).splitlines()
+        assert content == "hard-linked-home"
+        assert restored_inode != source_inode.strip()
+        await _run(restored_lease, "test ! -e workspace-marker", cwd=restored_lease.layout.workspace_dir)
+    finally:
+        primary_error = sys.exc_info()[0] is not None
+        cleanup_errors: list[BaseException] = []
+        for lease in leases:
+            try:
+                await bindings.release(lease)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        for allocation in reversed(allocations):
+            try:
+                await bindings.destroy_binding(
+                    ExecutionBindingDestroySpec(
+                        binding_ref=allocation.binding_ref,
+                        workspace_ref=allocation.workspace_ref,
+                        destroy_workspace=True,
+                    )
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if checkpoint_ref is not None:
+            try:
+                await snapshots.delete(checkpoint_ref)
             except BaseException as exc:
                 cleanup_errors.append(exc)
         if cleanup_errors and not primary_error:
@@ -216,6 +306,132 @@ async def test_e2b_binding_checkpoint_and_collection() -> None:
         if checkpoint_ref is not None:
             try:
                 await snapshots.delete(checkpoint_ref)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors and not primary_error:
+            raise cleanup_errors[0]
+
+
+@pytest.mark.anyio
+async def test_openshell_binding_lifecycle_and_independence() -> None:
+    """Real gateway contract: two Bindings get independent image-fresh Homes.
+
+    OpenShell cannot snapshot: the profile wires a no-op backend that reports
+    ``snapshot_ref: null``, and a second Binding must not inherit the first's
+    Home contents.
+    """
+    endpoint = _required_env("DIFY_AGENT_TEST_OPENSHELL_GATEWAY_ENDPOINT", "real OpenShell gateway")
+    image = _required_env("DIFY_AGENT_TEST_OPENSHELL_SANDBOX_IMAGE", "real OpenShell gateway")
+    driver_config_json = os.environ.get("DIFY_AGENT_TEST_OPENSHELL_DRIVER_CONFIG", "")
+    driver_config = json.loads(driver_config_json) if driver_config_json.strip() else {}
+    assert isinstance(driver_config, dict)
+    shellctl_token = os.environ.get("DIFY_AGENT_TEST_OPENSHELL_SHELLCTL_AUTH_TOKEN", "")
+    marker = uuid.uuid4().hex
+    control = OpenShellSDKControlPlane(
+        endpoint=endpoint,
+        workspace=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_WORKSPACE", "default"),
+        bearer_token=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_BEARER_TOKEN") or None,
+        tls_ca_path=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_TLS_CA_PATH") or None,
+        tls_client_cert_path=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_TLS_CLIENT_CERT_PATH") or None,
+        tls_client_key_path=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_TLS_CLIENT_KEY_PATH") or None,
+        insecure=os.environ.get("DIFY_AGENT_TEST_OPENSHELL_INSECURE", "").lower() == "true",
+        image=image,
+        driver_config=driver_config,
+    )
+    bindings = OpenShellExecutionBindingBackend(
+        control_plane=control,
+        shellctl_auth_token=shellctl_token,
+    )
+    allocation = None
+    second_allocation = None
+    lease = None
+    second_lease = None
+    try:
+        allocation = await bindings.create_binding(
+            ExecutionBindingCreateSpec(
+                tenant_id="integration-tenant",
+                agent_id="integration-agent",
+                binding_id=marker,
+                workspace_id=marker,
+                existing_workspace_ref=None,
+                home_snapshot_ref=None,
+            )
+        )
+        lease = await bindings.acquire(allocation.binding_ref)
+        await _run(lease, "printf openshell > probe.txt", cwd=lease.layout.workspace_dir)
+        await _run(lease, "printf marker > .marker", cwd=lease.layout.home_dir)
+        assert await _run(lease, "cat probe.txt", cwd=lease.layout.workspace_dir) == "openshell"
+        long_wait = await execute_complete_with_commands(
+            lease.commands,
+            "sleep 35; printf waited",
+            cwd=lease.layout.workspace_dir,
+            env={"HOME": lease.layout.home_dir},
+            timeout=45.0,
+            max_output_bytes=4096,
+        )
+        assert long_wait.exit_code == 0
+        assert long_wait.output_complete
+        assert long_wait.output.endswith("waited")
+        await bindings.release(lease)
+        lease = None
+
+        # A stopped sandbox restarts and retains its Home/Workspace contents.
+        await control.stop_sandbox(allocation.binding_ref)
+        lease = await bindings.acquire(allocation.binding_ref)
+        assert await _run(lease, "cat probe.txt", cwd=lease.layout.workspace_dir) == "openshell"
+        await bindings.release(lease)
+        lease = None
+
+        # A second Binding is image-fresh and independent of the first's Home.
+        second_allocation = await bindings.create_binding(
+            ExecutionBindingCreateSpec(
+                tenant_id="integration-tenant",
+                agent_id="integration-agent",
+                binding_id=f"second-{marker}",
+                workspace_id=f"second-{marker}",
+                existing_workspace_ref=None,
+                home_snapshot_ref=None,
+            )
+        )
+        second_lease = await bindings.acquire(second_allocation.binding_ref)
+        assert (
+            await _run(second_lease, "test ! -f .marker && printf clean", cwd=second_lease.layout.home_dir) == "clean"
+        )
+        await bindings.release(second_lease)
+        second_lease = None
+    finally:
+        primary_error = sys.exc_info()[0] is not None
+        cleanup_errors: list[BaseException] = []
+        if lease is not None:
+            try:
+                await bindings.release(lease)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if second_lease is not None:
+            try:
+                await bindings.release(second_lease)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if second_allocation is not None:
+            try:
+                await bindings.destroy_binding(
+                    ExecutionBindingDestroySpec(
+                        binding_ref=second_allocation.binding_ref,
+                        workspace_ref=second_allocation.workspace_ref,
+                        destroy_workspace=True,
+                    )
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if allocation is not None:
+            try:
+                await bindings.destroy_binding(
+                    ExecutionBindingDestroySpec(
+                        binding_ref=allocation.binding_ref,
+                        workspace_ref=allocation.workspace_ref,
+                        destroy_workspace=True,
+                    )
+                )
             except BaseException as exc:
                 cleanup_errors.append(exc)
         if cleanup_errors and not primary_error:

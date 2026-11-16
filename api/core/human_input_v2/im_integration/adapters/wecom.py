@@ -4,22 +4,27 @@ from __future__ import annotations
 
 import time
 from email.headerregistry import Address
+from json import JSONDecodeError
 from typing import Annotated, Literal, Protocol, override
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, RootModel, StrictInt, StrictStr, ValidationError, field_validator
+from requests.exceptions import Timeout as RequestsTimeout
 from wechatpy.enterprise import WeChatClient
 from wechatpy.exceptions import WeChatClientException
 
 from core.human_input_v2.entities import IMProvider
+from core.human_input_v2.im_integration.adapters.avatar import read_avatars
 from core.human_input_v2.im_integration.adapters.credentials import WeComCredentials
 from core.human_input_v2.im_integration.adapters.entities import (
     CredentialTestFailure,
     CredentialTestFailureKind,
     CredentialTestSuccess,
+    CredentialTestTimeoutError,
     Directory,
     DirectoryEntry,
     DirectoryReadFailure,
+    IMProviderError,
     MessageAccepted,
     MessageSendingError,
     MessageSendingResult,
@@ -124,6 +129,12 @@ class _AccessTokenStatus(BaseModel):
     errcode: StrictInt
 
 
+class _HTTPResponseMetadata(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True, from_attributes=True)
+
+    status_code: int | None = None
+
+
 class _WeComClientWithBoundedTokenFetch(WeChatClient):
     @override
     def fetch_access_token(self) -> object:
@@ -139,7 +150,7 @@ class _WeComClientWithBoundedTokenFetch(WeChatClient):
         payload = response.json()
         status = _AccessTokenStatus.model_validate(payload)
         if status.errcode != 0:
-            raise WeChatClientException(status.errcode, None)
+            raise WeChatClientException(status.errcode, None, response=response)
 
         token = _AccessTokenResponse.model_validate(payload)
         self.session.set(self.access_token_key, token.access_token, token.expires_in)
@@ -198,6 +209,14 @@ class _DirectoryUser(BaseModel):
     userid: StrictStr
     name: StrictStr | None = None
     email: StrictStr | None = None
+    avatar_url: str | None = Field(default=None, alias="avatar")
+
+    @field_validator("avatar_url", mode="before")
+    @classmethod
+    def _normalize_avatar_url(cls, value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        return value.strip() or None
 
     @field_validator("email")
     @classmethod
@@ -281,7 +300,7 @@ class _WeComDirectory(IMDirectory):
         if scope.agentid != int(self._credentials.agent_id):
             raise _DirectoryBoundaryError
 
-        entries: list[DirectoryEntry] = []
+        entries: list[_DirectoryUser] = []
         seen_user_ids: set[str] = set()
         seen_department_ids: set[int] = set()
 
@@ -312,7 +331,18 @@ class _WeComDirectory(IMDirectory):
                     seen_department_ids,
                 )
 
-        return Directory(tuple(entries))
+        avatars = read_avatars([user.avatar_url for user in entries])
+        return Directory(
+            tuple(
+                DirectoryEntry(
+                    ProviderUserId(user.userid),
+                    _optional_non_blank(user.name),
+                    _optional_non_blank(user.email),
+                    avatar=avatar,
+                )
+                for user, avatar in zip(entries, avatars, strict=True)
+            )
+        )
 
 
 class _WeComMessaging(IMMessaging):
@@ -325,7 +355,11 @@ class _WeComMessaging(IMMessaging):
         self._token_provider = token_provider
 
     @override
-    def send_text(self, provider_user_id: ProviderUserId, body: str) -> MessageSendingResult:
+    def send_text(
+        self, provider_user_id: ProviderUserId, body: str, subject: str | None = None
+    ) -> MessageSendingResult:
+        if subject is not None:
+            body = f"{subject}\n\n{body}"
         try:
             access_token = self._token_provider.get()
             client = _new_client(self._credentials, access_token=access_token)
@@ -380,36 +414,63 @@ class WeComIMProviderAdapter:
 
     def test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure:
         try:
-            client = _new_client(self._credentials)
+            return self._test_credentials()
+        except (TimeoutError, httpx.TimeoutException, RequestsTimeout) as error:
+            raise CredentialTestTimeoutError() from error
+        except httpx.HTTPStatusError as error:
+            try:
+                rejection = _AccessTokenStatus.model_validate(error.response.json())
+            except (JSONDecodeError, ValidationError):
+                provider_error_code = None
+            else:
+                provider_error_code = str(rejection.errcode)
+            return CredentialTestFailure(
+                CredentialTestFailureKind.UNKNOWN,
+                _CREDENTIAL_TEST_FAILED,
+                provider_error_code=provider_error_code,
+                http_status=error.response.status_code,
+            )
+
+    def _test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure:
+        client = _new_client(self._credentials)
+        try:
             _fetch_access_token(client)
         except WeChatClientException as error:
-            if error.errcode in _AUTHENTICATION_REJECTION_CODES:
-                return CredentialTestFailure(CredentialTestFailureKind.AUTHENTICATION_REJECTED, _CREDENTIAL_REJECTED)
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-        except ValidationError:
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-        # The SDK can surface transport and decoding failures outside its documented
-        # exception hierarchy. The shared boundary must normalize all of them.
-        except Exception:
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-
+            if error.errcode is None and error.response is None:
+                raise
+            kind = (
+                CredentialTestFailureKind.AUTHENTICATION_REJECTED
+                if error.errcode in _AUTHENTICATION_REJECTION_CODES
+                else CredentialTestFailureKind.UNKNOWN
+            )
+            return CredentialTestFailure(
+                kind,
+                _CREDENTIAL_REJECTED,
+                provider_error_code=str(error.errcode) if error.errcode is not None else None,
+                http_status=_HTTPResponseMetadata.model_validate(error.response).status_code
+                if error.response is not None
+                else None,
+            )
         try:
             agent = _AgentResponse.model_validate(client.agent.get(int(self._credentials.agent_id)))
         except WeChatClientException as error:
+            if error.errcode is None and error.response is None:
+                raise
+            kind = CredentialTestFailureKind.UNKNOWN
             if error.errcode in _TENANT_BOUNDARY_REJECTION_CODES:
-                return CredentialTestFailure(
-                    CredentialTestFailureKind.TENANT_ID_UNAVAILABLE,
-                    _TENANT_BOUNDARY_UNAVAILABLE,
-                )
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-        except ValidationError:
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-        # See the token boundary above; no Provider exception may cross this API.
-        except Exception:
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
-
+                kind = CredentialTestFailureKind.PERMISSION_DENIED
+            elif error.errcode in _AUTHENTICATION_REJECTION_CODES:
+                kind = CredentialTestFailureKind.AUTHENTICATION_REJECTED
+            return CredentialTestFailure(
+                kind,
+                _TENANT_BOUNDARY_UNAVAILABLE,
+                provider_error_code=str(error.errcode) if error.errcode is not None else None,
+                http_status=_HTTPResponseMetadata.model_validate(error.response).status_code
+                if error.response is not None
+                else None,
+            )
         if agent.agentid != int(self._credentials.agent_id):
-            return CredentialTestFailure(CredentialTestFailureKind.UNKNOWN, _CREDENTIAL_TEST_FAILED)
+            raise IMProviderError("WeCom returned a different application identity.")
         return CredentialTestSuccess(IMProvider.WE_COM, self._credentials.corp_id)
 
     @property
@@ -460,7 +521,7 @@ def _fetch_access_token(client: _WeComClient) -> str:
 def _read_department_scope(
     client: _WeComClient,
     root_department_id: int,
-    entries: list[DirectoryEntry],
+    entries: list[_DirectoryUser],
     seen_user_ids: set[str],
     seen_department_ids: set[int],
 ) -> None:
@@ -518,7 +579,7 @@ def _validate_department_topology(
 def _read_user_details(
     client: _WeComClient,
     user_id: str,
-    entries: list[DirectoryEntry],
+    entries: list[_DirectoryUser],
     seen_user_ids: set[str],
 ) -> None:
     _require_valid_user_id(user_id)
@@ -532,20 +593,14 @@ def _read_user_details(
 
 def _append_directory_user(
     user: _DirectoryUser,
-    entries: list[DirectoryEntry],
+    entries: list[_DirectoryUser],
     seen_user_ids: set[str],
 ) -> None:
     _require_valid_user_id(user.userid)
     if user.userid in seen_user_ids:
         return
     seen_user_ids.add(user.userid)
-    entries.append(
-        DirectoryEntry(
-            ProviderUserId(user.userid),
-            _optional_non_blank(user.name),
-            _optional_non_blank(user.email),
-        )
-    )
+    entries.append(user)
 
 
 def _require_valid_user_id(user_id: str) -> None:

@@ -1,30 +1,16 @@
+import type { NodeDataMigrationBlocker } from '@dify/contracts/api/console/workspaces/types.gen'
 import type { HumanInputNodeType } from '../../human-input/types'
 import type { HumanInputV2NodeType } from '../types'
 import type { Edge, Node } from '@/app/components/workflow/types'
 
-export type MigrationMember = {
-  id: string
-  email?: string | null
-}
-
-export type MigrationContact = {
-  id: string
-  email: string
-}
-
-export type HumanInputMigrationResolverSnapshot = {
-  members: readonly MigrationMember[]
-  contacts: readonly MigrationContact[]
-}
-
-export type HumanInputMigrationApiRequest = {
+type HumanInputMigrationApiRequest = {
   nodes: Array<{
     node_id: string
     node_data: HumanInputNodeType
   }>
 }
 
-export type HumanInputMigrationApiResult =
+type HumanInputMigrationApiResult =
   | {
       status: 'success'
       data: Array<{
@@ -43,27 +29,31 @@ export type HumanInputMigrationApi = {
 
 export const HumanInputMigrationBlockerCode = {
   UnsupportedVersion: 'unsupported-version',
+  UnsupportedInputType: 'unsupported-input-type',
   ConfiguredDisabledMethod: 'configured-disabled-method',
   UnsupportedDeliveryMethod: 'unsupported-delivery-method',
   InvalidEmailConfiguration: 'invalid-email-configuration',
   InvalidEmail: 'invalid-email',
+  InvalidDefaultValue: 'invalid-default-value',
   UnresolvedMember: 'unresolved-member',
   ConflictingEmailTemplates: 'conflicting-email-templates',
   MissingRecipients: 'missing-recipients',
 } as const
 
 export type HumanInputMigrationBlockerCode =
-  (typeof HumanInputMigrationBlockerCode)[keyof typeof HumanInputMigrationBlockerCode]
+  | NodeDataMigrationBlocker['code']
+  | typeof HumanInputMigrationBlockerCode.UnsupportedInputType
 
 export type HumanInputMigrationBlocker = {
   nodeId: string
   nodeTitle: string
-  code: HumanInputMigrationBlockerCode
   methodId?: string
-  value?: string
-}
+} & (
+  | { code: NodeDataMigrationBlocker['code']; value?: string }
+  | { code: typeof HumanInputMigrationBlockerCode.UnsupportedInputType; value: string }
+)
 
-export type HumanInputMigrationReplacement = {
+type HumanInputMigrationReplacement = {
   nodeId: string
   data: HumanInputV2NodeType
 }

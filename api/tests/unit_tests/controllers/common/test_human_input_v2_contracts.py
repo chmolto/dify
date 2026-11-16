@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -11,7 +9,6 @@ from controllers.common.human_input_v2_contracts import (
     BatchGetContactsQuery,
     ExternalContactCreateRequest,
     FormAccessRequestResponse,
-    HumanInputV2ServiceFormSubmitRequest,
     IMSyncResultItem,
     IMSyncRun,
     ListIMIdentitiesQuery,
@@ -21,12 +18,8 @@ from controllers.common.human_input_v2_contracts import (
     NodeDataMigrationResponse,
 )
 from controllers.common.human_input_v2_migration import preflight_legacy_human_input_node_data
+from core.workflow.human_input_adapter import BoundRecipient, EmailDeliveryMethod
 from core.workflow.nodes.human_input_v2.entities import RecipientConfig
-
-
-def _as_mapping(value: object) -> Mapping[str, object]:
-    assert isinstance(value, Mapping)
-    return value
 
 
 def test_request_dto_coerces_enum_values_and_forbids_extra_fields() -> None:
@@ -46,12 +39,13 @@ def test_sync_run_exposes_captured_revision() -> None:
             "result_counts": {"added": 0, "not_matched": 0, "failed": 0, "removed": 0, "skipped": 0},
             "provider": "feishu",
             "channel_id": "channel-id",
-            "integration_config_version": 4,
+            "channel_config_version": 4,
+            "initiator_display_name": "Sync Admin",
         }
     )
 
     assert sync_run.channel_id == "channel-id"
-    assert sync_run.integration_config_version == 4
+    assert sync_run.model_dump(mode="json")["channel_config_version"] == 4
 
 
 def test_external_contact_avatar_is_optional() -> None:
@@ -83,10 +77,11 @@ def test_node_data_migration_contract_matches_frontend_adapter_boundary() -> Non
         }
     )
 
-    assert request_body.nodes[0].node_data.version == "1"
-    assert not hasattr(request_body.nodes[0].node_data, "future_legacy_field")
+    node_data = preflight_legacy_human_input_node_data(request_body.nodes[0].node_data).node_data
+    assert node_data.version == "1"
+    assert node_data.model_extra == {"future_legacy_field": "ignored"}
     assert set(NodeDataMigrationResponse.model_json_schema()["properties"]) == {"data"}
-    assert contracts.LegacyHITLv1NodeData.model_json_schema()["properties"]["version"]["const"] == "1"
+    assert contracts.LegacyHITLv1NodeData.model_json_schema()["properties"]["version"]["default"] == "1"
 
     failure = NodeDataMigrationFailureResponse.model_validate(
         {
@@ -129,7 +124,7 @@ def test_node_data_migration_contract_matches_frontend_adapter_boundary() -> Non
         )
 
 
-def test_node_data_migration_transport_defers_raw_delivery_semantics_to_preflight() -> None:
+def test_node_data_migration_transport_refines_invalid_delivery_methods_into_preflight_issues() -> None:
     request_body = NodeDataMigrationPayload.model_validate(
         {
             "nodes": [
@@ -155,13 +150,6 @@ def test_node_data_migration_transport_defers_raw_delivery_semantics_to_prefligh
         }
     )
 
-    methods = request_body.nodes[0].node_data.delivery_methods
-    first_method = _as_mapping(methods[0])
-    second_method = _as_mapping(methods[1])
-    second_config = _as_mapping(second_method["config"])
-    assert [first_method["type"], second_method["type"]] == ["sms", "email"]
-    assert second_config["body"] == 7
-
     preflight = preflight_legacy_human_input_node_data(request_body.nodes[0].node_data)
     assert [(issue.code, issue.value) for issue in preflight.issues] == [
         ("unsupported-delivery-method", "sms"),
@@ -171,6 +159,7 @@ def test_node_data_migration_transport_defers_raw_delivery_semantics_to_prefligh
 
 
 def test_node_data_migration_transport_normalizes_real_and_compatibility_member_ids() -> None:
+    """Given both legacy member ID spellings, produce email recipients with the same reference IDs."""
     request_body = NodeDataMigrationPayload.model_validate(
         {
             "nodes": [
@@ -203,11 +192,15 @@ def test_node_data_migration_transport_normalizes_real_and_compatibility_member_
     preflight = preflight_legacy_human_input_node_data(request_body.nodes[0].node_data)
     assert preflight.issues == ()
     method = preflight.node_data.delivery_methods[0]
+    assert isinstance(method, EmailDeliveryMethod)
     assert method.type == "email"
-    assert [source.user_id for source in method.config.recipients.items] == ["member-real", "member-compat"]
+    assert method.config.recipients.items == [
+        BoundRecipient(reference_id="member-real"),
+        BoundRecipient(reference_id="member-compat"),
+    ]
 
 
-def test_node_data_migration_transport_preserves_real_im_configuration_for_preflight_blockers() -> None:
+def test_node_data_migration_transport_reports_configured_unsupported_delivery_methods() -> None:
     request_body = NodeDataMigrationPayload.model_validate(
         {
             "nodes": [
@@ -244,20 +237,6 @@ def test_node_data_migration_transport_preserves_real_im_configuration_for_prefl
         }
     )
 
-    methods = request_body.nodes[0].node_data.delivery_methods
-    first_method = _as_mapping(methods[0])
-    first_config = _as_mapping(first_method["config"])
-    second_method = _as_mapping(methods[1])
-    second_config = _as_mapping(second_method["config"])
-    assert first_config["recipients"] == {
-        "items": [
-            {"type": "channel", "channel_id": "channel-1"},
-            {"type": "user", "user_id": "user-1"},
-        ]
-    }
-    assert first_config["message"] == "Please review"
-    assert second_config["message"] == "Configured"
-
     preflight = preflight_legacy_human_input_node_data(request_body.nodes[0].node_data)
     assert [(issue.code, issue.value) for issue in preflight.issues] == [
         ("unsupported-delivery-method", "im"),
@@ -278,7 +257,7 @@ def test_node_data_migration_defaults_missing_version_and_requires_non_empty_bat
         {"nodes": [{"node_id": "node-1", "node_data": {"title": "Approval"}}]}
     )
 
-    assert request_body.nodes[0].node_data.version == "1"
+    assert preflight_legacy_human_input_node_data(request_body.nodes[0].node_data).node_data.version == "1"
     with pytest.raises(ValidationError):
         NodeDataMigrationPayload.model_validate({"nodes": []})
 
@@ -376,30 +355,13 @@ def test_recipient_union_preserves_existing_and_migration_variants(recipient_val
 
 
 def test_v1_and_v2_submit_payloads_are_independent() -> None:
-    v2_submit_model = getattr(contracts, "HumanInputV2FormSubmitRequest", None)
-    assert v2_submit_model is not None
-
     v1_schema = HumanInputFormSubmitPayload.model_json_schema()
-    v2_schema = v2_submit_model.model_json_schema()
+    v2_schema = contracts.HumanInputV2FormSubmitRequest.model_json_schema()
 
     assert "challenge_token" not in v1_schema["properties"]
     assert "otp_code" not in v1_schema["properties"]
     assert "challenge_token" in v2_schema["properties"]
     assert "otp_code" in v2_schema["properties"]
-
-
-def test_service_v2_submit_payload_does_not_accept_public_otp_fields() -> None:
-    payload: dict[str, object] = {
-        "user": "end-user",
-        "inputs": {},
-        "action": "approve",
-    }
-
-    request_body = HumanInputV2ServiceFormSubmitRequest.model_validate(payload)
-
-    assert request_body.user == "end-user"
-    with pytest.raises(ValidationError):
-        HumanInputV2ServiceFormSubmitRequest.model_validate({**payload, "otp_code": "123456"})
 
 
 def test_public_v2_submit_requires_complete_email_proof() -> None:

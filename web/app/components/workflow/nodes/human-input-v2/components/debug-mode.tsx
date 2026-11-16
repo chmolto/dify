@@ -1,29 +1,44 @@
 'use client'
 
-import type { HumanInputV2DebugMode } from '../types'
+import type { HumanInputV2DebugChannel, HumanInputV2DebugMode } from '../types'
+import { Button } from '@langgenius/dify-ui/button'
 import { Checkbox } from '@langgenius/dify-ui/checkbox'
-import { cn } from '@langgenius/dify-ui/cn'
+import { IconButton } from '@langgenius/dify-ui/icon-button'
+import { Infotip, InfotipContent, InfotipTrigger } from '@langgenius/dify-ui/infotip'
 import { Popover, PopoverContent, PopoverTrigger } from '@langgenius/dify-ui/popover'
 import { Switch } from '@langgenius/dify-ui/switch'
 import { useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { HUMAN_INPUT_V2_DEBUG_CHANNELS, isHumanInputV2DebugChannel } from '../types'
+import { ContactChannelIcon } from '@/features/contacts/management/channel-icon'
+import { isHumanInputV2DebugChannel } from '../types'
+import useConfiguredChannels from '../use-configured-channels'
 
 type DebugModeProps = {
   value: HumanInputV2DebugMode
   onChange: (value: HumanInputV2DebugMode) => void
   readonly: boolean
+  email?: string
 }
 
-const DebugMode = ({ value, onChange, readonly }: DebugModeProps) => {
-  const { t } = useTranslation()
+const DebugMode = ({ value, onChange, readonly, email }: DebugModeProps) => {
+  const { t } = useTranslation(['workflow', 'contacts', 'common'])
   const errorId = useId()
   const [open, setOpen] = useState(false)
+  const configured = useConfiguredChannels()
   const channels = value.channels as string[]
   const unsupported = channels.filter((channel) => !isHumanInputV2DebugChannel(channel))
-  const selected = channels.filter(isHumanInputV2DebugChannel)
+  const selected = channels
+    .filter(isHumanInputV2DebugChannel)
+    .filter((channel) => configured.channels.includes(channel))
+  const missingSelection = configured.isSuccess && value.enabled && !selected.length
 
-  const toggleChannel = (channel: (typeof HUMAN_INPUT_V2_DEBUG_CHANNELS)[number]) => {
+  const toggleChannel = (channel: HumanInputV2DebugChannel) => {
+    if (
+      readonly ||
+      !configured.channels.includes(channel) ||
+      (selected.length === 1 && selected[0] === channel)
+    )
+      return
     const nextChannels = channels.includes(channel)
       ? channels.filter((item) => item !== channel)
       : [...channels, channel]
@@ -31,88 +46,146 @@ const DebugMode = ({ value, onChange, readonly }: DebugModeProps) => {
   }
 
   return (
-    <section
-      className="px-4 py-2"
-      aria-describedby={
-        (value.enabled && !selected.length) || unsupported.length ? errorId : undefined
-      }
+    <div
+      className="px-4"
+      aria-describedby={missingSelection || unsupported.length ? errorId : undefined}
     >
       <div
-        className={cn(
-          'flex h-9 items-center gap-2 rounded-lg border border-components-option-card-option-border bg-background-section px-2',
-          readonly && 'opacity-70',
-        )}
+        data-readonly={readonly || undefined}
+        className="relative flex h-9 items-center gap-2 overflow-hidden rounded-lg border-[0.5px] border-components-panel-border bg-components-panel-on-panel-item-bg bg-[repeating-linear-gradient(135deg,rgba(16,24,40,0.02)_0_5px,transparent_5px_9.875px)] ps-2 pe-2.5 shadow-xs data-readonly:opacity-70"
       >
-        <span className="flex size-6 items-center justify-center rounded-md bg-components-icon-bg-blue-solid text-text-primary-on-surface">
-          <span className="i-ri-notification-3-line size-3.5" aria-hidden />
+        <span className="relative flex size-5 shrink-0 items-center justify-center rounded-md border border-divider-regular bg-components-icon-bg-orange-dark-solid bg-linear-to-br from-components-avatar-bg-mask-stop-0 to-components-avatar-bg-mask-stop-100 text-text-primary-on-surface">
+          <span className="i-ri-bug-line size-3.5" aria-hidden />
         </span>
-        <div className="min-w-0 grow">
-          <div className="system-xs-medium text-text-secondary">
+        <div className="relative flex min-w-0 grow items-center gap-1">
+          <div className="truncate system-sm-medium text-text-secondary">
             {t(($) => $['nodes.humanInputV2.debug.title'], { ns: 'workflow' })}
           </div>
-          {!!selected.length && (
-            <div className="truncate system-2xs-regular text-text-tertiary">
-              {selected
-                .map((channel) =>
-                  t(($) => $[`nodes.humanInputV2.debug.channel.${channel}`], { ns: 'workflow' }),
-                )
-                .join(', ')}
-            </div>
-          )}
+          <Infotip>
+            <InfotipTrigger
+              aria-label={t(($) => $['nodes.humanInputV2.debug.sendVia'], { ns: 'workflow' })}
+            />
+            <InfotipContent>
+              {t(($) => $['nodes.humanInputV2.debug.sendVia'], { ns: 'workflow' })}
+            </InfotipContent>
+          </Infotip>
         </div>
         <Popover open={open} onOpenChange={(nextOpen) => !readonly && setOpen(nextOpen)}>
           <PopoverTrigger
             render={
-              <button
-                type="button"
+              <IconButton
+                aria-describedby={selected.length ? `${errorId}-selected` : undefined}
                 disabled={readonly}
                 aria-label={t(($) => $['nodes.humanInputV2.debug.configure'], { ns: 'workflow' })}
-                className="flex size-6 items-center justify-center rounded-md border-0 bg-transparent text-text-tertiary hover:bg-state-base-hover focus-visible:ring-1 focus-visible:ring-state-accent-solid disabled:cursor-not-allowed"
+                className="relative h-6 w-auto shrink-0 gap-1 px-1"
               >
-                <span className="i-ri-settings-3-line size-4" aria-hidden />
-              </button>
+                <span className="flex items-center gap-1">
+                  {!!selected.length && (
+                    <span aria-hidden="true" className="flex items-center gap-1">
+                      {selected.map((channel) => (
+                        <ContactChannelIcon key={channel} provider={channel} className="size-4" />
+                      ))}
+                    </span>
+                  )}
+                  <span className="i-ri-equalizer-2-line size-4" aria-hidden />
+                </span>
+              </IconButton>
             }
           />
-          <PopoverContent placement="bottom-end" sideOffset={4} className="w-60! p-2!">
-            <div className="mb-1 system-xs-medium text-text-secondary">
+          <span className="sr-only" id={`${errorId}-selected`}>
+            {selected
+              .map((channel) =>
+                t(($) => $[`nodes.humanInputV2.debug.channel.${channel}`], { ns: 'workflow' }),
+              )
+              .join(', ')}
+          </span>
+          <PopoverContent
+            side="bottom"
+            align="end"
+            sideOffset={4}
+            className="w-60 bg-components-panel-bg-blur p-1 backdrop-blur-xs"
+          >
+            <div className="px-2 pt-1 pb-0.5 system-xs-medium text-text-tertiary">
               {t(($) => $['nodes.humanInputV2.debug.sendVia'], { ns: 'workflow' })}
             </div>
-            {HUMAN_INPUT_V2_DEBUG_CHANNELS.map((channel) => (
-              <label
-                key={channel}
-                className="flex h-8 cursor-pointer items-center gap-2 rounded-md px-1 hover:bg-state-base-hover"
+            {configured.isPending && (
+              <p role="status" className="px-2 py-1 system-xs-regular text-text-tertiary">
+                {t(($) => $['imPlatform.loading'], { ns: 'contacts' })}
+              </p>
+            )}
+            {configured.isError && (
+              <div role="alert" className="px-2 py-1 system-xs-regular text-text-destructive">
+                {t(($) => $['imPlatform.loadError.title'], { ns: 'contacts' })}
+                <Button size="small" onClick={() => void configured.refetch()}>
+                  {t(($) => $['operation.retry'], { ns: 'common' })}
+                </Button>
+              </div>
+            )}
+            {configured.isSuccess && !configured.channels.length && (
+              <p role="status" className="px-2 py-1 system-xs-regular text-text-tertiary">
+                {t(($) => $['nodes.humanInputV2.template.notConfigured'], { ns: 'workflow' })}
+              </p>
+            )}
+            {configured.channels.map((channel) => {
+              const isLastChannel = selected.length === 1 && selected[0] === channel
+              const label = t(($) => $[`nodes.humanInputV2.debug.channel.${channel}`], {
+                ns: 'workflow',
+              })
+              return (
+                <label
+                  key={channel}
+                  className="flex min-h-8 items-center gap-1 rounded-lg px-2 hover:bg-state-base-hover"
+                >
+                  <Checkbox
+                    aria-labelledby={`${errorId}-${channel}-label`}
+                    aria-describedby={isLastChannel ? `${errorId}-keep-channel` : undefined}
+                    checked={channels.includes(channel)}
+                    disabled={readonly}
+                    aria-disabled={isLastChannel || undefined}
+                    onCheckedChange={() => toggleChannel(channel)}
+                  />
+                  <ContactChannelIcon provider={channel} className="ms-1 size-4 shrink-0" />
+                  <span
+                    id={`${errorId}-${channel}-label`}
+                    className="shrink-0 system-md-regular text-text-secondary"
+                  >
+                    {label}
+                  </span>
+                  {channel === 'email' && email && (
+                    <span className="truncate system-xs-regular text-text-tertiary" title={email}>
+                      {email}
+                    </span>
+                  )}
+                </label>
+              )
+            })}
+            {selected.length === 1 && (
+              <p
+                id={`${errorId}-keep-channel`}
+                className="px-2 py-1 system-xs-regular text-text-tertiary"
               >
-                <Checkbox
-                  checked={channels.includes(channel)}
-                  onCheckedChange={() => toggleChannel(channel)}
-                />
-                <span className="flex size-5 items-center justify-center rounded-md bg-components-icon-bg-blue-solid text-text-primary-on-surface">
-                  <span className="i-ri-notification-line size-3" aria-hidden />
-                </span>
-                <span className="system-xs-regular text-text-secondary">
-                  {t(($) => $[`nodes.humanInputV2.debug.channel.${channel}`], { ns: 'workflow' })}
-                </span>
-              </label>
-            ))}
+                {t(($) => $['nodes.humanInputV2.debug.keepOneChannel'], { ns: 'workflow' })}
+              </p>
+            )}
           </PopoverContent>
         </Popover>
-        <div className="h-4 w-px bg-divider-regular" />
+        <div className="relative h-3 w-1.25 shrink-0 border-s border-divider-regular" />
         <Switch
           aria-label={t(($) => $['nodes.humanInputV2.debug.toggle'], { ns: 'workflow' })}
-          aria-describedby={value.enabled && !selected.length ? errorId : undefined}
+          aria-describedby={missingSelection ? errorId : undefined}
           checked={value.enabled}
-          disabled={readonly}
+          disabled={readonly || (!value.enabled && !configured.channels.length)}
           onCheckedChange={(enabled) => onChange({ ...value, enabled })}
         />
       </div>
-      {value.enabled && !selected.length && (
+      {missingSelection && (
         <div id={errorId} role="alert" className="mt-1 system-xs-regular text-text-destructive">
           {t(($) => $['nodes.humanInputV2.error.debugChannelRequired'], { ns: 'workflow' })}
         </div>
       )}
       {!!unsupported.length && (
         <div
-          id={value.enabled && !selected.length ? undefined : errorId}
+          id={missingSelection ? undefined : errorId}
           role="alert"
           className="mt-1 system-xs-regular text-text-destructive"
         >
@@ -122,7 +195,7 @@ const DebugMode = ({ value, onChange, readonly }: DebugModeProps) => {
           })}
         </div>
       )}
-    </section>
+    </div>
   )
 }
 

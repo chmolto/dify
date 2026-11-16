@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Discriminator, Field, field_validator
 
-from core.human_input_v2.entities import IMProvider
+from core.human_input_v2.entities import DebugChannel
 from core.workflow.nodes.human_input.entities import (
     FormInputConfig,
     TimeoutUnit,
@@ -70,19 +70,9 @@ class MessageTemplateConfig(BaseModel):
     body: str
 
 
-class Channel(enum.StrEnum):
-    EMAIL = enum.auto()
-    FEISHU = IMProvider.FEISHU.value
-    SLACK = IMProvider.SLACK.value
-    DING_TALK = IMProvider.DING_TALK.value
-    MS_TEAMS = IMProvider.MS_TEAMS.value
-    WE_COM = IMProvider.WE_COM.value
-    LARK = IMProvider.LARK.value
-
-
 class DebugModeConfig(BaseModel):
     enabled: bool = False
-    channels: Sequence[Channel]
+    channels: Sequence[DebugChannel]
 
 
 HUMAN_INPUT_NODE_TYPE: typing.Final[Literal["human-input"]] = "human-input"
@@ -98,7 +88,7 @@ def _version_validator(version: str) -> str:
 class HumanInputNodeData(BaseNodeData):
     """Human Input node data."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True, validate_default=True)
 
     # BaseNodeData exposes the discriminator as a class variable, while the
     # concrete Pydantic model must validate and serialize an exact wire value.
@@ -115,7 +105,7 @@ class HumanInputNodeData(BaseNodeData):
     inputs: list[FormInputConfig] = Field(default_factory=list[FormInputConfig])
     user_actions: list[UserActionConfig] = Field(default_factory=list[UserActionConfig])
     timeout: int = 36
-    timeout_unit: TimeoutUnit = TimeoutUnit.HOUR
+    timeout_unit: TimeoutUnit = Field(default=TimeoutUnit.HOUR, strict=False)
 
     @field_validator("inputs")
     @classmethod

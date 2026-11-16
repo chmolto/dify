@@ -1,6 +1,7 @@
 """Explicit bidirectional mappings for IM domain values and ORM records."""
 
 from datetime import datetime
+from typing import assert_never
 
 from pydantic import NaiveDatetime
 
@@ -18,6 +19,12 @@ from core.human_input_v2.im_integration import (
     SyncResultFact,
 )
 from core.human_input_v2.im_integration.adapters.entities import ProviderUserId
+from core.human_input_v2.im_integration.sync_records import (
+    AccountIMSyncInitiator,
+    IMSyncInitiator,
+    SysUserId,
+    SysUserIMSyncInitiator,
+)
 from core.human_input_v2.shared import (
     AccountId,
     ContactId,
@@ -26,7 +33,6 @@ from core.human_input_v2.shared import (
     IMReconciliationChangeId,
     IMSyncResultId,
     IMSyncRunId,
-    IntegrationId,
     NormalizedEmail,
 )
 from libs.datetime_utils import ensure_naive_utc
@@ -40,6 +46,7 @@ from models.human_input_v2 import (
     IMSyncDirectoryEntryPayload,
     IMSyncIdentitySnapshot,
 )
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 
 
 def _timestamp(value: datetime) -> NaiveDatetime:
@@ -48,12 +55,25 @@ def _timestamp(value: datetime) -> NaiveDatetime:
     return ensure_naive_utc(value)
 
 
+def _sync_initiator_from_record(record: HumanInputIMSyncRun) -> IMSyncInitiator:
+    """Restore the identity guaranteed by the database's exactly-one constraint."""
+    account_id = record.started_by_account_id
+    sys_user_id = record.started_by_sys_user_id
+    if account_id is not None:
+        if sys_user_id is not None:
+            raise AssertionError("IM sync run must contain exactly one initiating identity")
+        return AccountIMSyncInitiator(AccountId(account_id))
+    if sys_user_id is None:
+        raise AssertionError("IM sync run must contain exactly one initiating identity")
+    return SysUserIMSyncInitiator(SysUserId(sys_user_id))
+
+
 def sync_run_from_record(record: HumanInputIMSyncRun) -> IMSyncRun:
     """Map one sync run record into its independent aggregate."""
 
     return IMSyncRun(
         id=IMSyncRunId(record.id),
-        channel_revision=IMChannelRevision(record.integration_id, record.integration_config_version),
+        channel_revision=IMChannelRevision(record.channel_id, record.channel_config_version),
         provider=record.provider,
         status=record.status,
         added_count=record.added_count,
@@ -61,9 +81,7 @@ def sync_run_from_record(record: HumanInputIMSyncRun) -> IMSyncRun:
         failed_count=record.failed_count,
         removed_count=record.removed_count,
         skipped_count=record.skipped_count,
-        started_by_account_id=(
-            AccountId(record.started_by_account_id) if record.started_by_account_id is not None else None
-        ),
+        started_by=_sync_initiator_from_record(record),
         started_at=_timestamp(record.started_at) if record.started_at is not None else None,
         finished_at=_timestamp(record.finished_at) if record.finished_at is not None else None,
         error_code=record.error_code,
@@ -74,11 +92,21 @@ def sync_run_from_record(record: HumanInputIMSyncRun) -> IMSyncRun:
 
 
 def sync_run_to_record(run: IMSyncRun) -> HumanInputIMSyncRun:
-    """Map one sync aggregate into a detached record."""
+    """Map either initiating identity into exactly one column of a detached record."""
+
+    match run.started_by:
+        case AccountIMSyncInitiator(account_id):
+            started_by_account_id = str(account_id)
+            started_by_sys_user_id = None
+        case SysUserIMSyncInitiator(sys_user_id):
+            started_by_account_id = None
+            started_by_sys_user_id = str(sys_user_id)
+        case unexpected:
+            assert_never(unexpected)
 
     record = HumanInputIMSyncRun(
-        integration_id=run.channel_revision.channel_id,
-        integration_config_version=run.channel_revision.config_version,
+        channel_id=run.channel_revision.channel_id,
+        channel_config_version=run.channel_revision.config_version,
         provider=run.provider,
         status=run.status,
         added_count=run.added_count,
@@ -86,7 +114,8 @@ def sync_run_to_record(run: IMSyncRun) -> HumanInputIMSyncRun:
         failed_count=run.failed_count,
         removed_count=run.removed_count,
         skipped_count=run.skipped_count,
-        started_by_account_id=str(run.started_by_account_id) if run.started_by_account_id is not None else None,
+        started_by_account_id=started_by_account_id,
+        started_by_sys_user_id=started_by_sys_user_id,
         started_at=run.started_at if run.started_at is not None else None,
         finished_at=run.finished_at if run.finished_at is not None else None,
         error_code=run.error_code,
@@ -105,7 +134,7 @@ def sync_result_from_record(record: HumanInputIMSyncResult) -> SyncResultFact:
     identity_snapshot = record.identity_snapshot
     return SyncResultFact(
         id=IMSyncResultId(record.id),
-        integration_id=IntegrationId(record.integration_id),
+        channel_id=IMChannelId(record.channel_id),
         sync_run_id=IMSyncRunId(record.sync_run_id),
         operation_key=record.operation_key,
         result_type=record.result_type,
@@ -159,7 +188,7 @@ def sync_result_to_record(result: SyncResultFact) -> HumanInputIMSyncResult:
     contact_snapshot = result.contact_snapshot
     identity_snapshot = result.identity_snapshot
     record = HumanInputIMSyncResult(
-        integration_id=str(result.integration_id),
+        channel_id=str(result.channel_id),
         sync_run_id=str(result.sync_run_id),
         operation_key=result.operation_key,
         result_type=result.result_type,
@@ -212,7 +241,7 @@ def reconciliation_change_from_record(record: HumanInputIMReconciliationChange) 
 
     return IMReconciliationChange(
         id=IMReconciliationChangeId(record.id),
-        integration_id=IntegrationId(record.integration_id),
+        channel_id=IMChannelId(record.channel_id),
         sync_run_id=IMSyncRunId(record.sync_run_id),
         operation_key=record.operation_key,
         subject_kind=record.subject_kind,
@@ -231,7 +260,7 @@ def reconciliation_change_to_record(change: IMReconciliationChange) -> HumanInpu
     """Map one immutable change value into a detached append-only ORM record."""
 
     record = HumanInputIMReconciliationChange(
-        integration_id=str(change.integration_id),
+        channel_id=str(change.channel_id),
         sync_run_id=str(change.sync_run_id),
         operation_key=change.operation_key,
         subject_kind=change.subject_kind,

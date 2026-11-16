@@ -6,7 +6,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.human_input_v2.entities import IMProvider
@@ -17,9 +17,10 @@ from core.human_input_v2.im_message_inbox import (
     InboxEventValidationError,
     InboxPersistenceError,
 )
-from core.human_input_v2.shared import IntegrationId
-from models.human_input_v2 import IMMessageInbox
+from models.human_input_v2 import IMMessageEvent
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 from repositories.human_input_v2.im_message_inbox.repository import SQLAlchemyIMMessageInboxRepository
+from services.human_input_v2.im_message_inbox.storage import IMInboxStorage
 
 _NOW = datetime(2026, 8, 2, 8, tzinfo=UTC)
 _RECEIVED_AT = datetime(2026, 8, 2, 8)
@@ -47,73 +48,123 @@ def _event(
     )
 
 
-def _repository(sqlite_engine: Engine) -> tuple[SQLAlchemyIMMessageInboxRepository, sessionmaker[Session]]:
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
+def _repository(sqlite_engine: Engine) -> tuple[IMInboxStorage, sessionmaker[Session]]:
     session_maker = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
-    return SQLAlchemyIMMessageInboxRepository(session_maker), session_maker
+    return IMInboxStorage(session_maker), session_maker
 
 
 def test_unidentified_callbacks_create_independent_records(sqlite_engine: Engine) -> None:
     repository, session_maker = _repository(sqlite_engine)
 
-    first = repository.insert_or_resolve(IntegrationId("integration-1"), _event(None), now=_NOW)
-    second = repository.insert_or_resolve(IntegrationId("integration-1"), _event(None), now=_NOW)
+    first = repository.insert_or_resolve(IMChannelId("channel-1"), _event(None), now=_NOW)
+    second = repository.insert_or_resolve(IMChannelId("channel-1"), _event(None), now=_NOW)
 
     assert first.kind is AcceptanceKind.NEW
     assert second.kind is AcceptanceKind.NEW
     assert first.record_id != second.record_id
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 2
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 2
+
+
+def test_repository_callback_write_can_be_rolled_back_by_its_caller(sqlite_engine: Engine) -> None:
+    _, sessions = _repository(sqlite_engine)
+    with sessions() as session:
+        SQLAlchemyIMMessageInboxRepository(session).insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
+        session.rollback()
+    with sessions() as session:
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
 
 
 @pytest.mark.parametrize("blank_event_id", ["", " \t\n", " " * 129])
 def test_blank_event_id_is_persisted_as_unidentified(sqlite_engine: Engine, blank_event_id: str) -> None:
     repository, session_maker = _repository(sqlite_engine)
 
-    repository.insert_or_resolve(IntegrationId("integration-1"), _event(blank_event_id), now=_NOW)
+    repository.insert_or_resolve(IMChannelId("channel-1"), _event(blank_event_id), now=_NOW)
 
     with session_maker() as session:
-        stored = session.scalar(sa.select(IMMessageInbox))
+        stored = session.scalar(sa.select(IMMessageEvent))
         assert stored is not None
-        assert stored.provider_event_id is None
+        assert stored.event_id is None
 
 
-def test_identified_duplicate_resolves_same_record_without_mutating_callback_facts(sqlite_engine: Engine) -> None:
+@pytest.mark.parametrize("duplicate_tenant_id", ["tenant-1", "tenant-2"])
+def test_identified_duplicate_resolves_same_record_without_mutating_callback_facts(
+    sqlite_engine: Engine, duplicate_tenant_id: str
+) -> None:
     repository, session_maker = _repository(sqlite_engine)
     first_event = _event(ingress_kind=IMEventIngressKind.WEBHOOK, payload='{"source":"webhook"}')
-    duplicate_event = _event(ingress_kind=IMEventIngressKind.STREAM, payload='{"source":"stream"}')
+    duplicate_event = _event(
+        tenant_id=duplicate_tenant_id,
+        ingress_kind=IMEventIngressKind.STREAM,
+        payload='{"source":"stream"}',
+    )
 
-    first = repository.insert_or_resolve(IntegrationId("integration-1"), first_event, now=_NOW)
-    duplicate = repository.insert_or_resolve(IntegrationId("integration-2"), duplicate_event, now=_NOW)
+    first = repository.insert_or_resolve(IMChannelId("channel-1"), first_event, now=_NOW)
+    duplicate = repository.insert_or_resolve(IMChannelId("channel-2"), duplicate_event, now=_NOW)
 
     assert first.kind is AcceptanceKind.NEW
     assert duplicate.kind is AcceptanceKind.DUPLICATE
     assert duplicate.record_id == first.record_id
     with session_maker() as session:
-        stored = session.get_one(IMMessageInbox, str(first.record_id))
-        assert stored.integration_id == "integration-1"
+        stored = session.get_one(IMMessageEvent, str(first.record_id))
+        assert stored.channel_id == "channel-1"
+        assert stored.tenant_id == first_event.provider_tenant_id
         assert stored.ingress_kind is IMEventIngressKind.WEBHOOK
         assert stored.payload == first_event.payload
+
+
+def test_same_event_id_from_different_providers_creates_independent_records(sqlite_engine: Engine) -> None:
+    repository, _ = _repository(sqlite_engine)
+
+    first = repository.insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
+    second = repository.insert_or_resolve(IMChannelId("channel-2"), _event(provider=IMProvider.SLACK), now=_NOW)
+
+    assert first.kind is AcceptanceKind.NEW
+    assert second.kind is AcceptanceKind.NEW
+    assert first.record_id != second.record_id
+
+
+def test_database_rejects_same_provider_event_across_tenants(sqlite_engine: Engine) -> None:
+    repository, sessions = _repository(sqlite_engine)
+    accepted = repository.insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
+
+    with sessions() as session:
+        session.add(
+            IMMessageEvent(
+                channel_id="channel-2",
+                provider=IMProvider.FEISHU,
+                tenant_id="tenant-2",
+                event_id="event-1",
+                received_at=_RECEIVED_AT,
+                ingress_kind=IMEventIngressKind.WEBHOOK,
+                payload="{}",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.flush()
+
+    assert repository.get(accepted.record_id) is not None
+    with sessions() as session:
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 1
 
 
 def test_load_reconstructs_callback_facts(sqlite_engine: Engine) -> None:
     repository, _ = _repository(sqlite_engine)
     event = _event()
-    accepted = repository.insert_or_resolve(IntegrationId("integration-1"), event, now=_NOW)
+    accepted = repository.insert_or_resolve(IMChannelId("channel-1"), event, now=_NOW)
 
     record = repository.get(accepted.record_id)
 
     assert record is not None
     assert record.record_id == accepted.record_id
-    assert record.integration_id == IntegrationId("integration-1")
+    assert record.channel_id == IMChannelId("channel-1")
     assert record.event == event
     assert record.processed_at is None
 
 
 def test_mark_processed_records_callback_fact_and_is_idempotent(sqlite_engine: Engine) -> None:
     repository, session_maker = _repository(sqlite_engine)
-    accepted = repository.insert_or_resolve(IntegrationId("integration-1"), _event(), now=_NOW)
+    accepted = repository.insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
     processed_at = _NOW.replace(minute=1)
 
     repository.mark_processed(accepted.record_id, processed_at=processed_at)
@@ -123,7 +174,7 @@ def test_mark_processed_records_callback_fact_and_is_idempotent(sqlite_engine: E
     assert record is not None
     assert record.processed_at == datetime(2026, 8, 2, 8, 1)
     with session_maker() as session:
-        stored = session.get_one(IMMessageInbox, str(accepted.record_id))
+        stored = session.get_one(IMMessageEvent, str(accepted.record_id))
         assert stored.processed_at == datetime(2026, 8, 2, 8, 1)
 
 
@@ -153,13 +204,13 @@ def test_repository_rejects_oversized_callback_metadata(
 
     with pytest.raises(InboxEventValidationError, match=field_name):
         repository.insert_or_resolve(
-            IntegrationId("integration-1"),
+            IMChannelId("channel-1"),
             _event(event_id, tenant_id=tenant_id, event_type=event_type),
             now=_NOW,
         )
 
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
 
 
 def test_transaction_commit_failure_rolls_back_callback(sqlite_engine: Engine) -> None:
@@ -171,10 +222,27 @@ def test_transaction_commit_failure_rolls_back_callback(sqlite_engine: Engine) -
     sqlalchemy_event.listen(sqlite_engine, "commit", fail_commit)
     try:
         with pytest.raises(InboxPersistenceError) as error:
-            repository.insert_or_resolve(IntegrationId("integration-1"), _event(), now=_NOW)
+            repository.insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
     finally:
         sqlalchemy_event.remove(sqlite_engine, "commit", fail_commit)
 
     assert "must-not-escape" not in str(error.value)
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
+
+
+def test_request_ip_belongs_to_each_insert(sqlite_engine: Engine) -> None:
+    storage, _ = _repository(sqlite_engine)
+    first = storage.insert_or_resolve(
+        IMChannelId("channel-1"), _event("event-1"), now=_NOW, request_ip_address="192.0.2.20"
+    )
+    without_ip = storage.insert_or_resolve(IMChannelId("channel-1"), _event("event-2"), now=_NOW)
+    third = storage.insert_or_resolve(
+        IMChannelId("channel-1"), _event("event-3"), now=_NOW, request_ip_address="192.0.2.21"
+    )
+    storage.mark_processed(first.record_id, processed_at=_NOW)
+
+    for accepted, expected_ip in ((first, "192.0.2.20"), (without_ip, None), (third, "192.0.2.21")):
+        record = storage.get(accepted.record_id)
+        assert record is not None
+        assert record.request_ip_address == expected_ip

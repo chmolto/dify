@@ -1,4 +1,3 @@
-/* oxlint-disable react/only-export-components */
 import type { TFunction } from 'i18next'
 import type { FormInputItem } from '../types'
 import { cn } from '@langgenius/dify-ui/cn'
@@ -181,7 +180,7 @@ const SelectPreview: React.FC<{ label: string; options: string[] }> = ({ label, 
   )
 }
 
-const FileUploadPreview: React.FC<{ methods: TransferMethod[]; t: TFunction }> = ({
+const FileUploadPreview: React.FC<{ methods: TransferMethod[]; t: TFunction<['common']> }> = ({
   methods,
   t,
 }) => {
@@ -221,7 +220,7 @@ export const Note: React.FC<{ input: FormInputItem; nodeName: (nodeId: string) =
   input,
   nodeName,
 }) => {
-  const { t } = useTranslation()
+  const { t } = useTranslation(['common', 'appDebug', 'workflow', 'workflowHumanInput'])
   if (isSelectFormInput(input)) {
     const isVariable = input.option_source.type === 'variable'
     if (isVariable) {
@@ -232,7 +231,9 @@ export const Note: React.FC<{ input: FormInputItem; nodeName: (nodeId: string) =
             <Variable path={variablePath} />
           ) : (
             <span>
-              {t(($) => $['nodes.humanInput.insertInputField.variable'], { ns: 'workflow' })}
+              {t(($) => $['nodes.humanInput.insertInputField.variable'], {
+                ns: 'workflowHumanInput',
+              })}
             </span>
           )}
         </div>
@@ -252,11 +253,12 @@ export const Note: React.FC<{ input: FormInputItem; nodeName: (nodeId: string) =
     return <FileUploadPreview methods={input.allowed_file_upload_methods} t={t} />
   }
 
-  const isVariable = input.default.type === 'variable'
-  const newPath = sourceToVariablePath(input.default, nodeName)
+  const defaultValue = input.default
+  const isVariable = defaultValue?.type === 'variable'
+  const newPath = defaultValue ? sourceToVariablePath(defaultValue, nodeName) : ''
   return (
     <div className="my-3 rounded-[10px] bg-components-input-bg-normal px-2.5 py-2">
-      {isVariable ? <Variable path={newPath} /> : <span>{input.default.value}</span>}
+      {isVariable ? <Variable path={newPath} /> : <span>{defaultValue?.value ?? ''}</span>}
     </div>
   )
 }

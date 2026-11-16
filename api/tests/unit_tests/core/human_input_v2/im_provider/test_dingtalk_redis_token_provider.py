@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from types import SimpleNamespace
+from collections.abc import Callable
 from typing import NoReturn
 
 import pytest
@@ -10,7 +10,7 @@ from redis import RedisError
 
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters import DingTalkCredentials, dingtalk_redis
-from core.human_input_v2.im_integration.adapters import dingtalk as dingtalk_module
+from core.human_input_v2.im_integration.adapters.entities import IMProviderError
 
 
 class _NoIOCache:
@@ -134,8 +134,7 @@ def test_constructor_rejects_unresolved_credentials_before_client_or_cache_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(dingtalk_redis, "_new_oauth_client", lambda: pytest.fail("unexpected client construction"))
-    provider_type_name = "RedisCacheAccessTokenProvider"
-    provider_type = getattr(dingtalk_redis, provider_type_name)
+    provider_type: Callable[..., object] = dingtalk_redis.RedisCacheAccessTokenProvider
 
     with pytest.raises(TypeError, match="resolved DingTalk credentials"):
         provider_type(object(), _NoIOCache())
@@ -316,12 +315,12 @@ def test_non_redis_runtime_errors_are_not_silently_treated_as_cache_failures(
 @pytest.mark.parametrize(
     ("response", "expected_error"),
     [
-        (_ProviderError(401), dingtalk_module._AuthenticationRejectedError),
-        (_ProviderError(500), dingtalk_module._AccessTokenError),
-        (SimpleNamespace(body=None), dingtalk_module._AccessTokenError),
-        (_token_response(token=""), dingtalk_module._AccessTokenError),
-        (_token_response(expires_in=0), dingtalk_module._AccessTokenError),
-        (_token_response(expires_in=True), dingtalk_module._AccessTokenError),
+        (_ProviderError(401), _ProviderError),
+        (_ProviderError(500), _ProviderError),
+        (GetTokenResponse().from_map({"body": None}), IMProviderError),
+        (_token_response(token=""), IMProviderError),
+        (_token_response(expires_in=0), IMProviderError),
+        (_token_response(expires_in=True), IMProviderError),
     ],
 )
 def test_provider_failure_propagates_without_retry_or_cache_write(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Never, override
 from urllib.parse import quote
 
@@ -29,13 +29,14 @@ from core.human_input_v2.im_integration.adapters.entities import (
     CredentialTestFailure,
     CredentialTestFailureKind,
     CredentialTestSuccess,
+    IMProviderError,
 )
 from core.human_input_v2.im_integration.adapters.factory import build_im_provider_adapter
 from core.human_input_v2.shared import AccountId, TenantId
 from libs.datetime_utils import naive_utc_now
 from libs.key_providers.base import BaseKeyProvider
 from libs.uuid_utils import uuidv7
-from models.human_input_v2 import IMEncryptedCredentials
+from repositories.human_input_v2.channel_credentials import ChannelEncryptedCredentials
 from repositories.human_input_v2.im_channel_repository import (
     IMChannel,
     IMChannelAlreadyConfiguredError,
@@ -49,6 +50,10 @@ from repositories.human_input_v2.im_channel_repository import (
 from repositories.human_input_v2.sqlalchemy_im_channel_repository import (
     WorkspaceIMChannelReader,
     WorkspaceIMChannelWriter,
+)
+from services.human_input_v2.credential_update import (
+    IMCredentialsUpdate,
+    merge_im_credentials,
 )
 from services.human_input_v2.errors import (
     ChannelAlreadyConfiguredError,
@@ -94,7 +99,7 @@ class _PreparedIMChannelConfiguration:
 
     provider: IMProvider
     provider_tenant_id: str
-    encrypted_credentials: IMEncryptedCredentials
+    encrypted_credentials: ChannelEncryptedCredentials
     app_identifier: str
 
     def __post_init__(self) -> None:
@@ -121,6 +126,12 @@ class IMChannelView:
     app_identifier: str
     webhook_url: str | None
     config_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class IMChannelDetailView:
+    summary: IMChannelView
+    credentials: IMProviderCredentials = field(repr=False)
 
 
 class IMChannelService(ABC):
@@ -162,10 +173,29 @@ class IMChannelService(ABC):
 
         return self._to_view(self._load_addressed(channel_id))
 
+    def get_detail(self, channel_id: IMChannelId) -> IMChannelDetailView:
+        """Read complete saved credentials for explicit Console response projection."""
+
+        current = self._load_addressed(channel_id)
+        credentials = self._credential_codec.load(current.provider, current.encrypted_credentials)
+        return IMChannelDetailView(self._to_view(current), credentials)
+
     def test(self, credentials: IMProviderCredentials) -> None:
         """Validate only submitted credentials without persistence access."""
 
         self._test_credentials(credentials)
+
+    def test_saved(
+        self,
+        channel_id: IMChannelId,
+        expected_config_version: int,
+        credentials: IMCredentialsUpdate,
+    ) -> None:
+        """Test an edit against one saved snapshot without writing configuration."""
+
+        current = self._load_addressed(channel_id)
+        self._require_current_version(current, expected_config_version)
+        self._test_credentials(self._merge_credentials(current, credentials))
 
     def create(self, credentials: IMProviderCredentials) -> IMChannelView:
         """Validate and persist the first Channel after an owner-slot precheck."""
@@ -186,16 +216,15 @@ class IMChannelService(ABC):
         self,
         channel_id: IMChannelId,
         expected_config_version: int,
-        credentials: IMProviderCredentials,
+        credentials: IMProviderCredentials | IMCredentialsUpdate,
     ) -> IMChannelView:
-        """Rotate credentials while preserving Channel and provider identity."""
+        """Merge credential edits while preserving Channel and provider identity."""
 
         current = self._load_addressed(channel_id)
         self._require_current_version(current, expected_config_version)
-        if credentials.provider is not current.provider:
-            raise ReplacementRequiredError("IM provider replacement is required")
-
-        prepared = self._prepare_configuration(credentials)
+        resolved = self._merge_credentials(current, credentials)
+        # Encrypt the complete credential document after merging partial updates.
+        prepared = self._prepare_configuration(resolved)
         if prepared.provider_tenant_id != current.provider_tenant_id:
             raise ReplacementRequiredError("IM provider tenant replacement is required")
 
@@ -218,6 +247,28 @@ class IMChannelService(ABC):
         except StaleIMChannelWriteError:
             raise ProviderConfigurationUpdatedError("IM configuration was updated") from None
         return self._to_view(persisted)
+
+    def _merge_credentials(
+        self,
+        current: IMChannel,
+        credentials: IMProviderCredentials | IMCredentialsUpdate,
+    ) -> IMProviderCredentials:
+        if credentials.provider is not current.provider:
+            raise ReplacementRequiredError("IM provider replacement is required")
+        if isinstance(
+            credentials,
+            (
+                FeishuCredentials,
+                LarkCredentials,
+                SlackCredentials,
+                DingTalkCredentials,
+                MSTeamsCredentials,
+                WeComCredentials,
+            ),
+        ):
+            return credentials
+        stored = self._credential_codec.load(current.provider, current.encrypted_credentials)
+        return merge_im_credentials(stored, credentials)
 
     def replace(
         self,
@@ -277,25 +328,33 @@ class IMChannelService(ABC):
         adapter = build_im_provider_adapter(credentials)
         try:
             tested = adapter.test_credentials()
+        except IMProviderError as error:
+            raise ChannelProviderError(ProviderFailureKind.CONNECTION_FAILURE, str(error)) from error
         finally:
             adapter.close()
 
         if isinstance(tested, CredentialTestFailure):
-            self._raise_provider_failure(tested.kind)
+            self._raise_provider_failure(tested)
         if tested.provider is not credentials.provider:
             raise AssertionError("provider adapter returned a mismatched provider")
         return tested
 
     @staticmethod
-    def _raise_provider_failure(kind: CredentialTestFailureKind) -> Never:
-        if kind is CredentialTestFailureKind.AUTHENTICATION_REJECTED:
+    def _raise_provider_failure(failure: CredentialTestFailure) -> Never:
+        if failure.kind is CredentialTestFailureKind.AUTHENTICATION_REJECTED:
             raise ChannelProviderError(
                 ProviderFailureKind.INVALID_CREDENTIALS,
                 _INVALID_CREDENTIALS_DESCRIPTION,
+                provider_error_code=failure.provider_error_code,
+                missing_permissions=failure.missing_permissions,
+                http_status=failure.http_status,
             )
         raise ChannelProviderError(
             ProviderFailureKind.CONNECTION_FAILURE,
             _CONNECTION_FAILURE_DESCRIPTION,
+            provider_error_code=failure.provider_error_code,
+            missing_permissions=failure.missing_permissions,
+            http_status=failure.http_status,
         )
 
     @staticmethod

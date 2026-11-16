@@ -3,6 +3,7 @@ import DingTalkIcon from './assets/dingtalk.svg'
 import EmailIcon from './assets/email.svg'
 import FeishuIcon from './assets/feishu.svg'
 import SlackIcon from './assets/slack.svg'
+import WeComIcon from './assets/wecom.svg'
 
 export function ContactChannelIcon({
   className,
@@ -14,12 +15,14 @@ export function ContactChannelIcon({
   const normalizedProvider = provider.toLocaleLowerCase()
 
   const icon = {
-    ding_talk: DingTalkIcon,
-    dingtalk: DingTalkIcon,
-    email: EmailIcon,
-    feishu: FeishuIcon,
-    lark: FeishuIcon,
-    slack: SlackIcon,
+    ding_talk: DingTalkIcon.src,
+    dingtalk: DingTalkIcon.src,
+    email: EmailIcon.src,
+    feishu: FeishuIcon.src,
+    lark: FeishuIcon.src,
+    slack: SlackIcon.src,
+    we_com: WeComIcon.src,
+    wecom: WeComIcon.src,
   }[normalizedProvider]
 
   if (icon) {
@@ -28,11 +31,11 @@ export function ContactChannelIcon({
         alt=""
         aria-hidden
         className={cn(
-          'block shrink-0',
+          'block shrink-0 object-contain',
           normalizedProvider === 'email' ? 'size-4' : 'size-5',
           className,
         )}
-        src={icon.src}
+        src={icon}
       />
     )
   }

@@ -14,7 +14,7 @@ class HumanInputContactType(StrEnum):
     EXTERNAL = "external"
 
 
-class HumanInputDeliveryChannel(StrEnum):
+class ChannelKind(StrEnum):
     """Human Input channel kind used by management contracts."""
 
     EMAIL = "email"
@@ -42,6 +42,18 @@ class IMProvider(StrEnum):
             IMProvider.LARK,
             IMProvider.MS_TEAMS,
         }
+
+
+class DebugChannel(StrEnum):
+    """Delivery selection for editor debugging, resolved to current channel configuration."""
+
+    EMAIL = "email"
+    FEISHU = IMProvider.FEISHU.value
+    SLACK = IMProvider.SLACK.value
+    DING_TALK = IMProvider.DING_TALK.value
+    MS_TEAMS = IMProvider.MS_TEAMS.value
+    WE_COM = IMProvider.WE_COM.value
+    LARK = IMProvider.LARK.value
 
 
 class IMBindingScope(StrEnum):
@@ -94,11 +106,11 @@ class EmailProviderType(StrEnum):
 # Organization candidate identifiers round-trip as stable Contact IDs.
 OrganizationCandidateId = ContactId
 
-# Identifiers for synced IM identiies. This is not the same as user_id or account_id
-# on the IM provier side. It is the identifier for the synced IM user record in Dify.
+# Identifiers for synced IM identities. This is not the same as user_id or account_id
+# on the IM provider side. It is the identifier for the synced IM user record in Dify.
 IMIdentityId = NewType("IMIdentityId", str)
 
-# Identifiers for a full IM user synchorization.
+# Identifiers for a full IM user synchronization.
 IMSyncRunId = NewType("IMSyncRunId", str)
 
 # Identifier for an IM binding, an association between an IM identity and a Dify contact.
@@ -107,10 +119,11 @@ IMBindingId = NewType("IMBindingId", str)
 
 __all__ = [
     "AccountId",
+    "ChannelKind",
     "ContactId",
+    "DebugChannel",
     "EmailProviderType",
     "HumanInputContactType",
-    "HumanInputDeliveryChannel",
     "IMBindingId",
     "IMBindingScope",
     "IMIdentityBindingStatus",

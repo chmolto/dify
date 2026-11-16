@@ -3,20 +3,27 @@
 import type { ContactImIntegrationView, ContactImProviderDefinition } from './types'
 import { Button } from '@langgenius/dify-ui/button'
 import {
-  Dialog,
-  DialogClose,
-  DialogContent,
+  DialogBody,
   DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogHeaderCloseButton,
   DialogTitle,
 } from '@langgenius/dify-ui/dialog'
 import { Field, FieldDescription, FieldError, FieldLabel } from '@langgenius/dify-ui/field'
 import { Form } from '@langgenius/dify-ui/form'
-import { IconButton } from '@langgenius/dify-ui/icon-button'
 import { Input } from '@langgenius/dify-ui/input'
-import { useRef, useState } from 'react'
-import { useTranslation } from 'react-i18next'
+import { useId, useRef, useState } from 'react'
+import { Trans, useTranslation } from 'react-i18next'
+import { useDocLink } from '@/context/i18n'
+import { canRetainCredential } from './credential-draft'
 import { useSaveContactImCredentials, useTestContactImConnection } from './hooks'
-import { ContactImProvider } from './types'
+import {
+  ContactImProvider,
+  ContactImProviderField,
+  ContactImRepositoryError,
+  ContactImRepositoryErrorCode,
+} from './types'
 
 type EmailConfigValues = {
   senderEmail: string
@@ -25,19 +32,18 @@ type EmailConfigValues = {
 
 export type ContactEmailConfigDialogProps = {
   integration: ContactImIntegrationView | null
-  open: boolean
   provider: ContactImProviderDefinition
   onOpenChange: (open: boolean) => void
 }
 
-export function ContactEmailConfigDialog({
+export function ContactEmailConfigContent({
   integration,
-  open,
   provider,
   onOpenChange,
 }: ContactEmailConfigDialogProps) {
-  const { t } = useTranslation('contacts')
-  const { t: tCommon } = useTranslation('common')
+  const { t } = useTranslation(['contacts'])
+  const { t: tCommon } = useTranslation(['common'])
+  const docLink = useDocLink()
   const formRef = useRef<HTMLFormElement>(null)
   const saveCredentials = useSaveContactImCredentials()
   const testConnection = useTestContactImConnection()
@@ -46,20 +52,39 @@ export function ContactEmailConfigDialog({
     senderName: integration?.configuredValues.senderName ?? '',
   }))
   const [apiKey, setApiKey] = useState('')
+  const testLabelId = useId()
+  const saveLabelId = useId()
   const [testSucceeded, setTestSucceeded] = useState(false)
   const isPending = saveCredentials.isPending || testConnection.isPending
-  const retainSecret = Boolean(integration?.secretConfigured && !apiKey.trim())
+  const savedDetailsUnavailable =
+    saveCredentials.error instanceof ContactImRepositoryError &&
+    saveCredentials.error.code === ContactImRepositoryErrorCode.SavedDetailsUnavailable
+  const credentialsDisabled = isPending || savedDetailsUnavailable
+  const canRetainField = (field: ContactImProviderField) => canRetainCredential(integration, field)
+  const canRetainSecret = canRetainField(ContactImProviderField.Secret)
+  const safeErrorMessage = (error: unknown, fallback: string) => {
+    if (!(error instanceof ContactImRepositoryError)) return fallback
+    if (error.code === ContactImRepositoryErrorCode.ConfigurationUpdated)
+      return t(($) => $['imPlatform.configurationUpdated'])
+    if (error.code === ContactImRepositoryErrorCode.SavedDetailsUnavailable)
+      return t(($) => $['imPlatform.bindingDialog.savedDetailsUnavailable'])
+    if (error.code === ContactImRepositoryErrorCode.ReplacementRequired)
+      return t(($) => $['imPlatform.bindingDialog.replacementRequired'])
+    return error.statusDescription ?? fallback
+  }
 
   if (provider.provider !== ContactImProvider.Email)
     throw new Error('ContactEmailConfigDialog requires the Email provider definition')
 
   const command = () => ({
+    channelId: integration?.id,
+    expectedConfigVersion: integration?.config_version,
     provider: provider.provider,
-    retainSecret,
+    clearedFields: [],
     secret: apiKey.trim() || undefined,
     values: {
       senderEmail: values.senderEmail.trim(),
-      ...(values.senderName.trim() ? { senderName: values.senderName.trim() } : {}),
+      senderName: values.senderName.trim(),
     },
   })
 
@@ -67,12 +92,11 @@ export function ContactEmailConfigDialog({
 
   const closeDialog = () => {
     if (isPending) return
-    setApiKey('')
     onOpenChange(false)
   }
 
   const handleTestConnection = async () => {
-    if (testConnection.isPending || !validateForm()) return
+    if (credentialsDisabled || !validateForm()) return
 
     setTestSucceeded(false)
     try {
@@ -84,94 +108,130 @@ export function ContactEmailConfigDialog({
   }
 
   const handleSave = async () => {
-    if (saveCredentials.isPending) return
-
+    if (credentialsDisabled) return
+    setTestSucceeded(false)
     try {
       await saveCredentials.saveCredentials({
         ...command(),
         replaceActiveProvider: false,
+        channelId: integration?.id,
+        expectedConfigVersion: integration?.config_version,
       })
       setApiKey('')
       onOpenChange(false)
-    } catch {
-      setApiKey('')
+    } catch (error) {
+      if (
+        error instanceof ContactImRepositoryError &&
+        error.code === ContactImRepositoryErrorCode.SavedDetailsUnavailable
+      ) {
+        setApiKey('')
+        testConnection.reset()
+      }
+      // Ordinary write failures keep the draft available for correction and retry.
     }
   }
 
   return (
-    <Dialog
-      open={open}
-      disablePointerDismissal={isPending}
-      onOpenChange={(nextOpen) => {
-        if (!nextOpen) closeDialog()
-      }}
-    >
-      <DialogContent className="flex max-h-[calc(100dvh-2rem)] w-[520px] flex-col overflow-hidden! p-0!">
-        <DialogClose
-          render={
-            <IconButton
-              aria-label={tCommon(($) => $['operation.close'])}
-              className="absolute top-6 right-6"
-              disabled={isPending}
-              size="lg"
-            >
-              <span aria-hidden className="i-ri-close-line size-4" />
-            </IconButton>
-          }
+    <>
+      <DialogHeader>
+        <DialogHeaderCloseButton
+          aria-label={tCommon(($) => $['operation.close'])}
+          disabled={isPending}
         />
-        <div className="shrink-0 px-6 pt-6 pb-3">
-          <DialogTitle className="title-2xl-semi-bold text-text-primary">
-            {t(($) => $['imPlatform.email.title'])}
-          </DialogTitle>
-          <DialogDescription className="mt-1 system-xs-regular text-text-tertiary">
-            {t(($) => $['imPlatform.email.description'])}{' '}
-            <a
-              className="text-text-accent hover:underline focus-visible:ring-2 focus-visible:ring-state-accent-solid focus-visible:outline-hidden"
-              href="https://docs.dify.ai/"
-              rel="noreferrer"
-              target="_blank"
-            >
-              {t(($) => $['imPlatform.learnMore'])}
-            </a>
-          </DialogDescription>
-        </div>
+        <DialogTitle>{t(($) => $['imPlatform.email.title'])}</DialogTitle>
+        <DialogDescription>
+          <Trans
+            ns="contacts"
+            i18nKey={($) => $['imPlatform.email.description']}
+            components={{ emphasis: <span className="text-text-secondary" /> }}
+          />{' '}
+          <a
+            className="text-text-accent hover:underline focus-visible:ring-2 focus-visible:ring-state-accent-solid focus-visible:outline-hidden"
+            href={docLink('/use-dify/workspace/channels/email')}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {t(($) => $['imPlatform.learnMore'])}
+          </a>
+        </DialogDescription>
+      </DialogHeader>
 
-        <Form<EmailConfigValues>
-          ref={formRef}
-          className="flex min-h-0 flex-1 flex-col"
-          onFormSubmit={handleSave}
-        >
-          <div className="space-y-5 overflow-y-auto px-6 py-2">
-            <Field name="emailProvider">
-              <FieldLabel>{t(($) => $['imPlatform.email.provider'])}</FieldLabel>
-              <Input disabled value="Resend" />
-            </Field>
+      <Form<EmailConfigValues>
+        ref={formRef}
+        className="flex min-h-0 flex-1 flex-col"
+        onFormSubmit={handleSave}
+      >
+        <DialogBody className="space-y-6">
+          <div className="space-y-2">
+            <p className="system-sm-medium text-text-primary">
+              {t(($) => $['imPlatform.email.provider'])}
+            </p>
+            <p className="system-sm-regular text-text-primary">Resend</p>
+          </div>
 
-            <div className="flex items-center gap-2 pt-1">
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
               <span className="system-xs-medium-uppercase text-text-tertiary">
                 {t(($) => $['imPlatform.email.resendSettings'])}
               </span>
               <span className="h-px flex-1 bg-divider-subtle" />
             </div>
 
-            <p className="body-xs-regular text-text-tertiary">
-              {t(($) => $['imPlatform.email.resendDescription'])}
+            <p className="pb-0.5 body-xs-regular text-text-tertiary">
+              <Trans
+                ns="contacts"
+                i18nKey={($) => $['imPlatform.email.resendDescription']}
+                components={{
+                  apiKey: (
+                    <a
+                      className="rounded-sm underline decoration-text-tertiary/30 underline-offset-2 focus-visible:ring-2 focus-visible:ring-state-accent-solid focus-visible:outline-hidden"
+                      href="https://resend.com/docs/dashboard/api-keys/introduction"
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Resend {t(($) => $['imPlatform.email.apiKey'])}
+                    </a>
+                  ),
+                  resend: (
+                    <a
+                      className="rounded-sm underline decoration-text-tertiary/30 underline-offset-2 focus-visible:ring-2 focus-visible:ring-state-accent-solid focus-visible:outline-hidden"
+                      href="https://www.resend.com/"
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Resend
+                    </a>
+                  ),
+                }}
+              />
             </p>
 
             <Field name="senderEmail">
-              <FieldLabel>{t(($) => $['imPlatform.email.senderEmail'])}</FieldLabel>
-              <FieldDescription>
-                {t(($) => $['imPlatform.email.senderEmailDescription'])}
-              </FieldDescription>
+              <div>
+                <div className="flex items-center gap-1">
+                  <FieldLabel>{t(($) => $['imPlatform.email.senderEmail'])}</FieldLabel>
+                  {!canRetainField(ContactImProviderField.SenderEmail) && (
+                    <span aria-hidden className="system-xs-regular text-text-destructive-secondary">
+                      *
+                    </span>
+                  )}
+                </div>
+                <FieldDescription className="pt-0">
+                  {t(($) => $['imPlatform.email.senderEmailDescription'])}
+                </FieldDescription>
+              </div>
               <Input
-                required
+                required={!canRetainField(ContactImProviderField.SenderEmail)}
+                disabled={credentialsDisabled}
                 autoComplete="email"
-                placeholder="sybil@dify.ai"
+                placeholder="joe@example.com"
                 type="email"
                 value={values.senderEmail}
                 onChange={(event) => {
                   const senderEmail = event.currentTarget.value
                   setTestSucceeded(false)
+                  testConnection.reset()
+                  saveCredentials.reset()
                   setValues((current) => ({ ...current, senderEmail }))
                 }}
               />
@@ -184,39 +244,34 @@ export function ContactEmailConfigDialog({
             </Field>
 
             <Field name="senderName">
-              <FieldLabel>{t(($) => $['imPlatform.email.senderName'])}</FieldLabel>
-              <FieldDescription>
-                {t(($) => $['imPlatform.email.senderNameDescription'])}
-              </FieldDescription>
+              <div>
+                <div className="flex items-center gap-1">
+                  <FieldLabel className="block">
+                    {t(($) => $['imPlatform.email.senderName'])}
+                  </FieldLabel>
+                  {!canRetainField(ContactImProviderField.SenderName) && (
+                    <span aria-hidden className="system-xs-regular text-text-destructive-secondary">
+                      *
+                    </span>
+                  )}
+                </div>
+                <FieldDescription className="pt-0">
+                  {t(($) => $['imPlatform.email.senderNameDescription'])}
+                </FieldDescription>
+              </div>
               <Input
+                required={!canRetainField(ContactImProviderField.SenderName)}
+                disabled={credentialsDisabled}
+                maxLength={255}
                 autoComplete="organization"
-                placeholder="sybil"
+                placeholder="joe"
                 value={values.senderName}
                 onChange={(event) => {
                   const senderName = event.currentTarget.value
                   setTestSucceeded(false)
+                  testConnection.reset()
+                  saveCredentials.reset()
                   setValues((current) => ({ ...current, senderName }))
-                }}
-              />
-            </Field>
-
-            <Field name="apiKey">
-              <FieldLabel>{t(($) => $['imPlatform.email.apiKey'])}</FieldLabel>
-              <FieldDescription>
-                {integration?.secretConfigured
-                  ? t(($) => $['imPlatform.email.apiKeyConfigured'])
-                  : t(($) => $['imPlatform.email.apiKeyDescription'])}
-              </FieldDescription>
-              <Input
-                autoComplete="new-password"
-                placeholder={t(($) => $['imPlatform.email.apiKeyPlaceholder'])}
-                required={!integration?.secretConfigured}
-                type="password"
-                value={apiKey}
-                onChange={(event) => {
-                  const value = event.currentTarget.value
-                  setTestSucceeded(false)
-                  setApiKey(value)
                 }}
               />
               <FieldError match="valueMissing">
@@ -224,47 +279,103 @@ export function ContactEmailConfigDialog({
               </FieldError>
             </Field>
 
-            {testSucceeded && (
-              <div role="status" className="system-xs-regular text-text-success">
-                {t(($) => $['imPlatform.email.testSucceeded'])}
+            <Field name="apiKey">
+              <div>
+                <div className="flex items-center gap-1">
+                  <FieldLabel>{t(($) => $['imPlatform.email.apiKey'])}</FieldLabel>
+                  {!canRetainSecret && (
+                    <span aria-hidden className="system-xs-regular text-text-destructive-secondary">
+                      *
+                    </span>
+                  )}
+                </div>
+                <FieldDescription className="pt-0">
+                  {canRetainSecret
+                    ? t(($) => $['imPlatform.email.apiKeyConfigured'])
+                    : t(($) => $['imPlatform.email.apiKeyDescription'])}
+                </FieldDescription>
               </div>
-            )}
-            {testConnection.isError && (
-              <div role="alert" className="system-xs-regular text-text-destructive">
-                {t(($) => $['imPlatform.bindingDialog.testFailed'])}
-              </div>
-            )}
-            {saveCredentials.isError && (
-              <div role="alert" className="system-xs-regular text-text-destructive">
-                {t(($) => $['imPlatform.bindingDialog.saveFailed'])}
-              </div>
-            )}
+              <Input
+                disabled={credentialsDisabled}
+                autoComplete="off"
+                placeholder={
+                  canRetainSecret ? '••••••••' : t(($) => $['imPlatform.email.apiKeyPlaceholder'])
+                }
+                required={!canRetainSecret}
+                type="password"
+                value={apiKey}
+                onChange={(event) => {
+                  const value = event.currentTarget.value
+                  setTestSucceeded(false)
+                  testConnection.reset()
+                  saveCredentials.reset()
+                  setApiKey(value)
+                }}
+              />
+              <FieldError match="valueMissing">
+                {t(($) => $['imPlatform.bindingDialog.required'])}
+              </FieldError>
+            </Field>
           </div>
 
-          <div className="mt-auto flex shrink-0 items-center justify-between gap-3 px-6 pt-5 pb-6">
+          <div role="status" aria-atomic="true" className="system-xs-regular text-text-success">
+            {testSucceeded ? t(($) => $['imPlatform.email.testSucceeded']) : ''}
+          </div>
+          {testConnection.isError && (
+            <div role="alert" className="system-xs-regular text-text-destructive">
+              {safeErrorMessage(
+                testConnection.error,
+                t(($) => $['imPlatform.bindingDialog.testFailed']),
+              )}
+            </div>
+          )}
+          {saveCredentials.isError && (
+            <div role="alert" className="system-xs-regular text-text-destructive">
+              {safeErrorMessage(
+                saveCredentials.error,
+                t(($) => $['imPlatform.bindingDialog.saveFailed']),
+              )}
+            </div>
+          )}
+        </DialogBody>
+
+        <DialogFooter>
+          <div className="flex w-full items-center justify-between gap-3">
             <Button
-              disabled={isPending}
+              aria-labelledby={testLabelId}
+              disabled={saveCredentials.isPending || savedDetailsUnavailable}
               loading={testConnection.isPending}
               onClick={handleTestConnection}
             >
-              <span aria-hidden="true" className="i-ri-send-plane-line size-4" />
-              {testConnection.isPending
-                ? t(($) => $['imPlatform.action.testing'])
-                : t(($) => $['imPlatform.action.testConnection'])}
+              <span aria-hidden="true" className="i-ri-send-plane-2-line size-4" />
+              <span id={testLabelId}>
+                {testConnection.isPending
+                  ? t(($) => $['imPlatform.action.testing'])
+                  : t(($) => $['imPlatform.action.testConnection'])}
+              </span>
             </Button>
             <div className="flex gap-2">
-              <Button disabled={isPending} onClick={closeDialog}>
+              <Button className="min-w-18" disabled={isPending} onClick={closeDialog}>
                 {tCommon(($) => $['operation.cancel'])}
               </Button>
-              <Button type="submit" variant="primary" loading={saveCredentials.isPending}>
-                {saveCredentials.isPending
-                  ? t(($) => $['imPlatform.action.saving'])
-                  : t(($) => $['imPlatform.action.save'])}
+              <Button
+                aria-labelledby={saveLabelId}
+                type="submit"
+                className="min-w-18"
+                variant="primary"
+                disabled={testConnection.isPending || savedDetailsUnavailable}
+                loading={saveCredentials.isPending}
+              >
+                <span id={saveLabelId}>
+                  {saveCredentials.isPending
+                    ? t(($) => $['imPlatform.action.saving'])
+                    : t(($) => $['imPlatform.action.save'])}
+                </span>
               </Button>
             </div>
           </div>
-        </Form>
-      </DialogContent>
-    </Dialog>
+        </DialogFooter>
+      </Form>
+    </>
   )
 }

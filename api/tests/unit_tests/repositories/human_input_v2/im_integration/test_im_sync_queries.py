@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from core.human_input_v2.entities import IMIdentityBindingStatus, IMProvider, IMSyncResultType
 from core.human_input_v2.im_integration import IMChannelRevision, IMSyncRun, SyncResultFact
-from core.human_input_v2.shared import ContactId, IMIdentityId, IMSyncResultId, IMSyncRunId, IntegrationId
-from models.human_input_v2 import IMEncryptedCredentials
+from core.human_input_v2.im_integration.sync_records import SysUserId, SysUserIMSyncInitiator
+from core.human_input_v2.shared import ContactId, IMIdentityId, IMSyncResultId, IMSyncRunId
+from repositories.human_input_v2.channel_credentials import ChannelEncryptedCredentials
 from repositories.human_input_v2.im_binding_repository import IMBindingAssignment
 from repositories.human_input_v2.im_channel_repository import (
     IMChannel,
@@ -48,7 +49,7 @@ def _channel(channel_id: IMChannelId = _CHANNEL_ID) -> IMChannel:
         updated_at=_NOW,
         provider=IMProvider.FEISHU,
         provider_tenant_id=f"provider-{channel_id}",
-        encrypted_credentials=IMEncryptedCredentials(ciphertext="opaque-ciphertext"),
+        encrypted_credentials=ChannelEncryptedCredentials(ciphertext="opaque-ciphertext"),
         app_identifier="app-1",
         webhook_id=WebhookId("00000000000000000000000000000001"),
         config_version=1,
@@ -61,7 +62,7 @@ def _run(run_id: IMSyncRunId, created_at: datetime) -> IMSyncRun:
         sync_run_id=run_id,
         channel_revision=IMChannelRevision(str(_CHANNEL_ID), 1),
         provider=IMProvider.FEISHU,
-        started_by_account_id=None,
+        started_by=SysUserIMSyncInitiator(SysUserId("00000000-0000-0000-0000-000000000999")),
         now=created_at,
     )
 
@@ -73,7 +74,7 @@ def _result(
 ) -> SyncResultFact:
     return SyncResultFact(
         id=IMSyncResultId(result_id),
-        integration_id=IntegrationId(str(_CHANNEL_ID)),
+        channel_id=IMChannelId(str(_CHANNEL_ID)),
         sync_run_id=_LATEST_RUN_ID,
         operation_key=f"result:{result_id}",
         result_type=result_type,
@@ -109,7 +110,7 @@ def _observation(provider_user_id: str, display_name: str | None, email: str | N
 @pytest.fixture
 def sync_query_context(
     sqlite_engine: Engine,
-) -> Generator[_SyncQueryContext, None, None]:
+) -> Generator[_SyncQueryContext]:
     with Session(sqlite_engine, expire_on_commit=False) as session:
         identities = SQLAlchemyIMIdentityRepository(session, _CHANNEL_ID)
         bindings = SQLAlchemyIMBindingRepository(session, _CHANNEL_ID)
@@ -182,7 +183,7 @@ def test_result_query_rejects_invalid_page_boundaries(
 ) -> None:
     repository, _, _ = sync_query_context
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="page must be positive|limit must be between 1 and 100"):
         repository.page_sync_results(_LATEST_RUN_ID, IMSyncResultType.ADDED, page=page, limit=limit)
 
 

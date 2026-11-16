@@ -40,7 +40,8 @@ class DeploymentConfig(BaseSettings):
     )
 
     HUMAN_INPUT_IM_EVENT_TRANSPORT_MODE: IMEventTransportMode = Field(
-        description="Required deployment-wide transport for Human Input IM provider events."
+        IMEventTransportMode.WEBHOOK,
+        description="Required deployment-wide transport for Human Input IM provider events.",
     )
 
     INIT_PASSWORD: str = Field(

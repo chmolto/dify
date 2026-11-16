@@ -1,3 +1,4 @@
+import type { FormInputConfig } from '@dify/contracts/api/web/types.gen'
 import type {
   CommonNodeType,
   UploadFileSetting,
@@ -50,12 +51,12 @@ type BaseFormInputItem = {
 }
 
 export type ParagraphFormInput = BaseFormInputItem & {
-  type: InputVarType.paragraph
+  type: typeof InputVarType.paragraph
   default: StringDefault
 }
 
 export type SelectFormInput = BaseFormInputItem & {
-  type: InputVarType.select
+  type: typeof InputVarType.select
   option_source: StringListSource
 }
 
@@ -66,16 +67,53 @@ type SharedFileFormInput = Pick<
 
 export type FileFormInput = BaseFormInputItem &
   SharedFileFormInput & {
-    type: InputVarType.singleFile
+    type: typeof InputVarType.singleFile
   }
 
 export type FileListFormInput = BaseFormInputItem &
   SharedFileFormInput & {
-    type: InputVarType.multiFiles
+    type: typeof InputVarType.multiFiles
     number_limits?: UploadFileSetting['number_limits']
   }
 
 export type FormInputItem = ParagraphFormInput | SelectFormInput | FileFormInput | FileListFormInput
+
+/** Normalize API nullability and string discriminators at the shared form boundary. */
+export const normalizeHumanInputFormInput = (input: FormInputConfig): FormInputItem => {
+  if (input.type === 'paragraph')
+    return {
+      type: InputVarType.paragraph,
+      output_variable_name: input.output_variable_name,
+      default: {
+        type: input.default?.type ?? 'constant',
+        value: input.default?.value ?? '',
+        selector: input.default?.selector ?? [],
+      },
+    }
+  if (input.type === 'select')
+    return {
+      type: InputVarType.select,
+      output_variable_name: input.output_variable_name,
+      option_source: {
+        type: input.option_source.type,
+        value: input.option_source.value ?? [],
+        selector: input.option_source.selector ?? [],
+      },
+    }
+  const settings = {
+    output_variable_name: input.output_variable_name,
+    allowed_file_types: (input.allowed_file_types ?? []).map(
+      (type) => SupportUploadFileTypes[type],
+    ),
+    allowed_file_extensions: input.allowed_file_extensions ?? [],
+    allowed_file_upload_methods: (input.allowed_file_upload_methods ?? []).filter(
+      (method) => method === 'local_file' || method === 'remote_url',
+    ),
+  }
+  return input.type === 'file-list'
+    ? { ...settings, type: InputVarType.multiFiles, number_limits: input.number_limits }
+    : { ...settings, type: InputVarType.singleFile }
+}
 
 export const isParagraphFormInput = (input: FormInputItem): input is ParagraphFormInput => {
   return input.type === InputVarType.paragraph

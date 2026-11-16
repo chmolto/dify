@@ -6,7 +6,7 @@ import threading
 from collections import UserDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import get_args, get_origin, get_type_hints
+from typing import ClassVar, get_args, get_origin, get_type_hints
 from urllib.parse import urlencode
 
 import pytest
@@ -65,7 +65,8 @@ class _RecordingConsumer:
         self.events: list[AuthenticatedIMEvent] = []
         self._lock = threading.Lock()
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         with self._lock:
             self.events.append(event)
         return self.acceptance
@@ -159,7 +160,7 @@ def test_webhook_authentication_delegates_exact_body_to_official_sdk_verifier(mo
     verifier.is_valid.return_value = True
     verifier.is_valid_request.return_value = True
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps(
         {"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}},
         separators=(",", ":"),
@@ -195,37 +196,33 @@ def test_decoded_provider_json_boundaries_use_mapping_abstractions() -> None:
 
 
 def test_credential_test_normalizes_unexpected_failure_without_secret_leak(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.side_effect = RuntimeError("sanitized-client-secret")
     adapter = _adapter(mocker, client)
 
-    result = adapter.test_credentials()
-
-    assert result == CredentialTestFailure(
-        CredentialTestFailureKind.UNKNOWN,
-        "Slack credential testing could not be completed.",
-    )
+    with pytest.raises(RuntimeError, match="sanitized-client-secret") as captured:
+        adapter.test_credentials()
+    assert captured.value is client.auth_test.side_effect
 
 
 def test_credential_test_maps_transport_and_scope_failures_to_safe_results(mocker: MockerFixture) -> None:
-    transport_client = mocker.Mock(spec=WebClient)
+    transport_client = mocker.create_autospec(WebClient, instance=True)
     transport_client.auth_test.side_effect = SlackClientError("sanitized transport details")
-    transport_result = _adapter(mocker, transport_client).test_credentials()
+    with pytest.raises(SlackClientError) as captured:
+        _adapter(mocker, transport_client).test_credentials()
+    assert captured.value is transport_client.auth_test.side_effect
 
-    scope_client = mocker.Mock(spec=WebClient)
+    scope_client = mocker.create_autospec(WebClient, instance=True)
     scope_client.auth_test.return_value = _SlackResponse(
         {"ok": True, "team_id": "sanitized-team"},
         headers={"X-OAuth-Scopes": "chat:write, users:read"},
     )
     scope_result = _adapter(mocker, scope_client).test_credentials()
 
-    assert transport_result == CredentialTestFailure(
-        CredentialTestFailureKind.UNKNOWN,
-        "Slack credential testing could not be completed.",
-    )
     assert scope_result == CredentialTestFailure(
-        CredentialTestFailureKind.UNKNOWN,
+        CredentialTestFailureKind.PERMISSION_DENIED,
         "Slack baseline permissions could not be confirmed.",
+        missing_permissions=("users:read.email",),
     )
     scope_client.apps_connections_open.assert_not_called()
 
@@ -256,10 +253,15 @@ def test_credential_test_maps_socket_mode_sdk_failures(
     socket_failure: SlackClientError,
     expected_kind: CredentialTestFailureKind,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.return_value = _successful_auth_response()
     client.apps_connections_open.side_effect = socket_failure
 
+    if not isinstance(socket_failure, SlackApiError):
+        with pytest.raises(type(socket_failure)) as captured:
+            _adapter(mocker, client).test_credentials()
+        assert captured.value is socket_failure
+        return
     result = _adapter(mocker, client).test_credentials()
 
     assert isinstance(result, CredentialTestFailure)
@@ -280,7 +282,7 @@ def test_directory_rejects_incomplete_or_invalid_pages(
     mocker: MockerFixture,
     provider_response: _SlackResponse,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.users_list.return_value = provider_response
 
     result = _adapter(mocker, client).directory.read_directory()
@@ -290,7 +292,7 @@ def test_directory_rejects_incomplete_or_invalid_pages(
 
 
 def test_directory_skips_non_people_and_normalizes_optional_profile_fields(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.users_list.return_value = _SlackResponse(
         {
             "ok": True,
@@ -363,7 +365,7 @@ def test_directory_rejects_invalid_pagination_without_partial_snapshot(
     mocker: MockerFixture,
     provider_response: _SlackResponse,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.users_list.return_value = provider_response
 
     result = _adapter(mocker, client).directory.read_directory()
@@ -392,7 +394,7 @@ def test_directory_later_page_failure_discards_accumulated_entries(
     mocker: MockerFixture,
     second_page: _SlackResponse | SlackClientError,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.users_list.side_effect = (
         _SlackResponse(
             {
@@ -419,7 +421,7 @@ def test_directory_later_page_failure_discards_accumulated_entries(
 def test_directory_rejects_repeated_cursor_without_request_loop_or_partial_snapshot(
     mocker: MockerFixture,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.users_list.side_effect = (
         _SlackResponse(
             {
@@ -450,7 +452,7 @@ def test_directory_rejects_repeated_cursor_without_request_loop_or_partial_snaps
 def test_messaging_maps_card_transport_failure_without_workspace_preflight(
     mocker: MockerFixture,
 ) -> None:
-    transport_client = mocker.Mock(spec=WebClient)
+    transport_client = mocker.create_autospec(WebClient, instance=True)
     transport_client.chat_postMessage.side_effect = SlackClientError("sanitized transport details")
     transport_result = _adapter(mocker, transport_client).dynamic_card_messaging.send_card(
         ProviderUserId("sanitized-user"),
@@ -466,7 +468,7 @@ def test_messaging_maps_card_transport_failure_without_workspace_preflight(
 def test_static_replacement_maps_transport_failures_without_workspace_preflight(
     mocker: MockerFixture,
 ) -> None:
-    source_client = mocker.Mock(spec=WebClient)
+    source_client = mocker.create_autospec(WebClient, instance=True)
     source_client.chat_postMessage.return_value = _SlackResponse(
         {"ok": True, "channel": "sanitized-channel", "ts": "1000.000001"}
     )
@@ -477,14 +479,14 @@ def test_static_replacement_maps_transport_failures_without_workspace_preflight(
     )
     assert isinstance(accepted, MessageAccepted)
 
-    transport_client = mocker.Mock(spec=WebClient)
+    transport_client = mocker.create_autospec(WebClient, instance=True)
     transport_client.chat_update.side_effect = SlackClientError("sanitized transport details")
     transport_result = _adapter(mocker, transport_client).dynamic_card_messaging.replace_with_static(
         accepted.locator,
         StaticCardIntent("Sanitized static content"),
     )
 
-    unconfirmed_client = mocker.Mock(spec=WebClient)
+    unconfirmed_client = mocker.create_autospec(WebClient, instance=True)
     unconfirmed_client.chat_update.return_value = _SlackResponse({"ok": False})
     unconfirmed_result = _adapter(mocker, unconfirmed_client).dynamic_card_messaging.replace_with_static(
         accepted.locator,
@@ -512,7 +514,7 @@ def test_message_acceptance_requires_a_persistently_round_trippable_locator(
     channel_id: str,
     message_ts: str,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.return_value = _successful_auth_response()
     client.chat_postMessage.return_value = _SlackResponse({"ok": True, "channel": channel_id, "ts": message_ts})
     adapter = _adapter(mocker, client)
@@ -531,7 +533,7 @@ def test_real_paragraph_resolved_default_is_preserved_and_rendered(mocker: Mocke
             MarkdownFragment(text="After input"),
         )
     )
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.return_value = _successful_auth_response()
     client.chat_postMessage.return_value = _SlackResponse(
         {"ok": True, "channel": "sanitized-channel", "ts": "1000.000001"}
@@ -622,7 +624,7 @@ def test_card_assessment_rejects_slack_representation_boundaries(
     mocker: MockerFixture,
     intent: ResolvedForm,
 ) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     adapter = _adapter(mocker, client)
 
     assessment = adapter.dynamic_card_messaging.assess(intent)
@@ -638,7 +640,7 @@ def test_card_assessment_rejects_slack_representation_boundaries(
 
 
 def test_card_render_preserves_optional_sections_and_default_action_style(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.return_value = _successful_auth_response()
     client.chat_postMessage.side_effect = (
         _SlackResponse({"ok": True, "channel": "sanitized-channel", "ts": "1000.000001"}),
@@ -679,7 +681,7 @@ def test_card_render_preserves_optional_sections_and_default_action_style(mocker
 
 
 def test_card_send_rejects_oversized_serialized_correlation_before_provider_io(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     adapter = _adapter(mocker, client)
 
     with pytest.raises(DynamicCardMessagingError, match="correlation token"):
@@ -700,11 +702,14 @@ def test_webhook_consumer_failure_does_not_log_exception_details(
     sensitive_marker = "sanitized-sensitive-consumer-marker"
 
     class _FailingConsumer:
-        def accept(self, event: object) -> EventAcceptance:
+        def accept(self, event: object, *, request_ip_address: str | None = None) -> EventAcceptance:
+            del request_ip_address
             del event
             raise RuntimeError(sensitive_marker)
 
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(_FailingConsumer())
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(
+        _FailingConsumer()
+    )
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
 
     with caplog.at_level(logging.ERROR, logger=slack_adapter_module.__name__):
@@ -715,11 +720,11 @@ def test_webhook_consumer_failure_does_not_log_exception_details(
 
 
 def test_message_locator_can_be_reused_across_adapter_instances(mocker: MockerFixture) -> None:
-    first_client = mocker.Mock(spec=WebClient)
+    first_client = mocker.create_autospec(WebClient, instance=True)
     first_client.chat_postMessage.return_value = _SlackResponse(
         {"ok": True, "channel": "D0123456789", "ts": "1712345678.123456"}
     )
-    second_client = mocker.Mock(spec=WebClient)
+    second_client = mocker.create_autospec(WebClient, instance=True)
     second_client.chat_update.return_value = _SlackResponse({"ok": True})
     web_client = mocker.patch.object(slack_adapter_module, "WebClient", side_effect=(first_client, second_client))
     first_adapter = SlackIMProviderAdapter(_credentials())
@@ -747,12 +752,12 @@ def test_message_locator_can_be_reused_across_adapter_instances(mocker: MockerFi
     assert update_parameters["channel"] == "D0123456789"
     assert update_parameters["ts"] == "1712345678.123456"
     assert update_parameters["text"] == "Sanitized static content"
-    assert update_parameters["blocks"] == []
+    assert update_parameters["blocks"] == [{"type": "markdown", "text": "Sanitized static content"}]
     assert "markdown_text" not in update_parameters
 
 
 def test_static_replacement_rejects_foreign_reference_before_provider_io(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     adapter = _adapter(mocker, client)
 
     result = adapter.dynamic_card_messaging.replace_with_static(
@@ -767,7 +772,7 @@ def test_static_replacement_rejects_foreign_reference_before_provider_io(mocker:
 
 
 def test_static_replacement_rejects_public_text_reference_without_mutation(mocker: MockerFixture) -> None:
-    client = mocker.Mock(spec=WebClient)
+    client = mocker.create_autospec(WebClient, instance=True)
     client.auth_test.return_value = _successful_auth_response()
     client.chat_postMessage.return_value = _SlackResponse(
         {"ok": True, "channel": "sanitized-channel", "ts": "1000.000001"}
@@ -800,7 +805,7 @@ def test_static_replacement_maps_provider_failures_without_replay(
     error_code: str,
     expected_kind: ReplacementErrorKind,
 ) -> None:
-    first_client = mocker.Mock(spec=WebClient)
+    first_client = mocker.create_autospec(WebClient, instance=True)
     first_client.auth_test.return_value = _successful_auth_response()
     first_client.chat_postMessage.return_value = _SlackResponse(
         {"ok": True, "channel": "sanitized-channel", "ts": "1000.000001"}
@@ -830,7 +835,7 @@ def test_static_replacement_maps_provider_failures_without_replay(
 
 def test_webhook_rejects_authenticated_non_post_requests_before_parsing(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
     signed = _signed_request(body, received_at=datetime(2026, 8, 6, 8, tzinfo=UTC))
     request = WebhookRequest(
@@ -895,7 +900,7 @@ def test_webhook_parsing_fails_closed_without_partial_consumption(
     expected_events: int,
 ) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
 
     response = handler.handle(_signed_request(body, content_type=content_type))
 
@@ -929,7 +934,7 @@ def test_webhook_dispatches_body_parser_only_by_content_type(
     content_type: str,
 ) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
 
     response = handler.handle(_signed_request(body, content_type=content_type))
 
@@ -939,7 +944,7 @@ def test_webhook_dispatches_body_parser_only_by_content_type(
 
 def test_webhook_rejects_missing_or_duplicate_content_type(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
     missing = _signed_request(body, content_type=None)
     duplicate = _signed_request(body)
@@ -969,10 +974,13 @@ def test_webhook_signature_verifier_failures_are_safe_and_unauthenticated(
     verification_failure: Exception,
 ) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
-    verifier = mocker.Mock()
-    verifier.is_valid.side_effect = verification_failure
-    mocker.patch.object(slack_adapter_module, "SignatureVerifier", return_value=verifier)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
+
+    def fail_verification(self: slack_adapter_module.SignatureVerifier, **kwargs: object) -> bool:
+        del self, kwargs
+        raise verification_failure
+
+    mocker.patch.object(slack_adapter_module.SignatureVerifier, "is_valid", new=fail_verification)
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
 
     with caplog.at_level(logging.ERROR, logger=slack_adapter_module.__name__):
@@ -985,7 +993,7 @@ def test_webhook_signature_verifier_failures_are_safe_and_unauthenticated(
 
 def test_webhook_rejects_duplicate_verification_headers_before_consuming(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
     request = _signed_request(body)
     request = WebhookRequest(
@@ -1003,7 +1011,7 @@ def test_webhook_rejects_duplicate_verification_headers_before_consuming(mocker:
 
 def test_webhook_freshness_treats_trusted_naive_receive_time_as_utc(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps({"type": "event_callback", "team_id": "sanitized-team", "event": {"type": "message"}}).encode()
     received_at = datetime.now(tz=UTC).replace(tzinfo=None)
 
@@ -1036,7 +1044,7 @@ def test_sanitized_signed_webhook_structure_obeys_sdk_verification_boundaries(
 ) -> None:
     del case
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     signed_body = json.dumps(
         {
             "type": "event_callback",
@@ -1070,7 +1078,7 @@ def test_sanitized_signed_webhook_structure_obeys_sdk_verification_boundaries(
 
 def test_webhook_replay_within_freshness_window_remains_consumer_owned(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps(
         {
             "type": "event_callback",
@@ -1101,7 +1109,8 @@ def test_webhook_handler_supports_overlapping_calls_with_independent_responses(m
     maximum_active_calls = 0
 
     class _OverlappingConsumer:
-        def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+        def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+            del request_ip_address
             nonlocal active_calls, maximum_active_calls
             with state_lock:
                 active_calls += 1
@@ -1116,7 +1125,9 @@ def test_webhook_handler_supports_overlapping_calls_with_independent_responses(m
                 with state_lock:
                     active_calls -= 1
 
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(_OverlappingConsumer())
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(
+        _OverlappingConsumer()
+    )
     requests = {
         "accepted": _signed_request(
             json.dumps(
@@ -1167,7 +1178,7 @@ def test_webhook_handler_supports_overlapping_calls_with_independent_responses(m
 
 def test_webhook_without_confirmed_event_identity_does_not_synthesize_facts(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    handler = _adapter(mocker, mocker.Mock(spec=WebClient)).create_webhook_handler(consumer)
+    handler = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_webhook_handler(consumer)
     body = json.dumps(
         {
             "type": "event_callback",
@@ -1188,7 +1199,7 @@ def test_webhook_without_confirmed_event_identity_does_not_synthesize_facts(mock
 
 def test_webhook_handler_remains_usable_after_root_close(mocker: MockerFixture) -> None:
     consumer = _RecordingConsumer()
-    adapter = _adapter(mocker, mocker.Mock(spec=WebClient))
+    adapter = _adapter(mocker, mocker.create_autospec(WebClient, instance=True))
     handler = adapter.create_webhook_handler(consumer)
     adapter.close()
     adapter.close()
@@ -1231,7 +1242,8 @@ def test_socket_control_frames_and_not_accepted_business_events_are_not_acked(mo
             self.closed = True
 
     mocker.patch.object(slack_adapter_module, "SocketModeClient", _FakeSocketModeClient)
-    stream = _adapter(mocker, mocker.Mock(spec=WebClient)).create_stream_handler(consumer)
+    stream = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_stream_handler(consumer)
+    assert stream is not None
 
     stream.start()
 
@@ -1243,12 +1255,15 @@ def test_socket_control_frames_and_not_accepted_business_events_are_not_acked(mo
 
     stream.stop()
 
-    assert socket_client.closed is True
+    assert socket_client.closed
 
 
 def test_socket_stop_before_start_opens_no_connection_and_consumes_one_shot(mocker: MockerFixture) -> None:
     socket_client = mocker.patch.object(slack_adapter_module, "SocketModeClient")
-    stream = _adapter(mocker, mocker.Mock(spec=WebClient)).create_stream_handler(_RecordingConsumer())
+    stream = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_stream_handler(
+        _RecordingConsumer()
+    )
+    assert stream is not None
 
     stream.stop()
     stream.stop()
@@ -1265,6 +1280,7 @@ def test_socket_remote_disconnect_is_observable_without_adapter_lifecycle_transi
     caplog: pytest.LogCaptureFixture,
     disconnect_kind: str,
 ) -> None:
+    """Given a remote disconnect, notify listeners without changing the adapter lifecycle state."""
     sensitive_marker = f"sanitized-sensitive-remote-{disconnect_kind}"
     request = SocketModeRequest(
         type="events_api",
@@ -1274,7 +1290,7 @@ def test_socket_remote_disconnect_is_observable_without_adapter_lifecycle_transi
     consumer = _RecordingConsumer()
 
     class _ListenerSocketModeClient:
-        instance: _ListenerSocketModeClient | None = None
+        instance: ClassVar[_ListenerSocketModeClient | None] = None
 
         def __init__(
             self,
@@ -1301,7 +1317,8 @@ def test_socket_remote_disconnect_is_observable_without_adapter_lifecycle_transi
             self.closed = True
 
     mocker.patch.object(slack_adapter_module, "SocketModeClient", _ListenerSocketModeClient)
-    stream = _adapter(mocker, mocker.Mock(spec=WebClient)).create_stream_handler(consumer)
+    stream = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_stream_handler(consumer)
+    assert stream is not None
 
     with caplog.at_level(logging.ERROR, logger=slack_adapter_module.__name__):
         stream.start()
@@ -1316,7 +1333,7 @@ def test_socket_remote_disconnect_is_observable_without_adapter_lifecycle_transi
 
     socket_client = _ListenerSocketModeClient.instance
     assert socket_client is not None
-    assert socket_client.closed is True
+    assert socket_client.closed
     assert len(socket_client.responses) == 1
     assert len(consumer.events) == 1
     assert sensitive_marker not in caplog.text
@@ -1326,10 +1343,11 @@ def test_socket_close_listener_after_local_stop_is_normal_and_redacted(
     mocker: MockerFixture,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Given a close notification after local stop, treat it as normal and redact diagnostics."""
     sensitive_marker = "sanitized-sensitive-local-close"
 
     class _LocallyClosedSocketModeClient:
-        instance: _LocallyClosedSocketModeClient | None = None
+        instance: ClassVar[_LocallyClosedSocketModeClient | None] = None
 
         def __init__(
             self,
@@ -1351,7 +1369,10 @@ def test_socket_close_listener_after_local_stop_is_normal_and_redacted(
             self.on_close_listeners[0](1000, sensitive_marker)
 
     mocker.patch.object(slack_adapter_module, "SocketModeClient", _LocallyClosedSocketModeClient)
-    stream = _adapter(mocker, mocker.Mock(spec=WebClient)).create_stream_handler(_RecordingConsumer())
+    stream = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_stream_handler(
+        _RecordingConsumer()
+    )
+    assert stream is not None
 
     with caplog.at_level(logging.ERROR, logger=slack_adapter_module.__name__):
         stream.start()
@@ -1359,7 +1380,7 @@ def test_socket_close_listener_after_local_stop_is_normal_and_redacted(
 
     socket_client = _LocallyClosedSocketModeClient.instance
     assert socket_client is not None
-    assert socket_client.closed is True
+    assert socket_client.closed
     assert sensitive_marker not in caplog.text
 
 
@@ -1367,10 +1388,11 @@ def test_socket_connect_failure_is_normalized_and_cleans_up_partial_resources(
     mocker: MockerFixture,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Given a connection failure, report the normalized error and close partial resources."""
     sensitive_marker = "sanitized-sensitive-connect-failure"
 
     class _FailingSocketModeClient:
-        instance: _FailingSocketModeClient | None = None
+        instance: ClassVar[_FailingSocketModeClient | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -1387,7 +1409,10 @@ def test_socket_connect_failure_is_normalized_and_cleans_up_partial_resources(
             self.closed = True
 
     mocker.patch.object(slack_adapter_module, "SocketModeClient", _FailingSocketModeClient)
-    stream = _adapter(mocker, mocker.Mock(spec=WebClient)).create_stream_handler(_RecordingConsumer())
+    stream = _adapter(mocker, mocker.create_autospec(WebClient, instance=True)).create_stream_handler(
+        _RecordingConsumer()
+    )
+    assert stream is not None
 
     with caplog.at_level(logging.ERROR, logger=slack_adapter_module.__name__):
         with pytest.raises(IMStreamStartError) as raised:
@@ -1397,12 +1422,13 @@ def test_socket_connect_failure_is_normalized_and_cleans_up_partial_resources(
     socket_client = _FailingSocketModeClient.instance
     assert socket_client is not None
     assert socket_client.connect_calls == 1
-    assert socket_client.closed is True
+    assert socket_client.closed
     assert sensitive_marker not in str(raised.value)
     assert sensitive_marker not in caplog.text
 
 
 def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mocker: MockerFixture) -> None:
+    """Given an active consumer, delegate stop to the SDK without waiting for that consumer."""
     consumer_started = threading.Event()
     release_consumer = threading.Event()
     stop_finished = threading.Event()
@@ -1416,7 +1442,8 @@ def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mock
         def __init__(self) -> None:
             self.calls = 0
 
-        def accept(self, event: object) -> EventAcceptance:
+        def accept(self, event: object, *, request_ip_address: str | None = None) -> EventAcceptance:
+            del request_ip_address
             del event
             self.calls += 1
             consumer_started.set()
@@ -1426,7 +1453,7 @@ def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mock
     consumer = _BlockingConsumer()
 
     class _FakeSocketModeClient:
-        instance: _FakeSocketModeClient | None = None
+        instance: ClassVar[_FakeSocketModeClient | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -1448,8 +1475,9 @@ def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mock
             self.closed = True
 
     mocker.patch.object(slack_adapter_module, "SocketModeClient", _FakeSocketModeClient)
-    adapter = _adapter(mocker, mocker.Mock(spec=WebClient))
+    adapter = _adapter(mocker, mocker.create_autospec(WebClient, instance=True))
     stream = adapter.create_stream_handler(consumer)
+    assert stream is not None
 
     stream.start()
     assert consumer_started.wait(2)
@@ -1465,7 +1493,7 @@ def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mock
     assert stop_finished.wait(2)
     socket_client = _FakeSocketModeClient.instance
     assert socket_client is not None
-    assert socket_client.closed is True
+    assert socket_client.closed
 
     release_consumer.set()
     stop_thread.join(2)
@@ -1475,6 +1503,6 @@ def test_socket_stop_delegates_to_sdk_without_waiting_for_inflight_consumer(mock
     assert not stop_thread.is_alive()
     assert not socket_client.callback_thread.is_alive()
     assert stop_finished.is_set()
-    assert socket_client.closed is True
+    assert socket_client.closed
     assert len(socket_client.responses) == 1
     assert consumer.calls == 1

@@ -32,7 +32,6 @@ from core.human_input_v2.im_integration.adapters import (
 from core.human_input_v2.im_integration.adapters.credentials import (
     IMProviderCredentials as ProviderIMProviderCredentials,
 )
-from repositories.human_input_v2.email_channel import ResendCandidate
 
 _IM_CASES = (
     (
@@ -102,8 +101,6 @@ _IM_CASES = (
 )
 _RESEND_PAYLOAD = {
     "provider": "resend",
-    "sender_email": "sender@example.com",
-    "sender_name": "Dify",
     "api_key": "resend-api-key",
 }
 _SECRET_FIELD_NAMES = {
@@ -116,6 +113,54 @@ _SECRET_FIELD_NAMES = {
     "app_token",
     "secret",
 }
+
+
+@pytest.mark.parametrize(("_dto_type", "_owner_type", "payload"), _IM_CASES)
+def test_im_update_accepts_explicit_retention_for_every_provider(
+    _dto_type: type[object], _owner_type: type[object], payload: dict[str, str]
+) -> None:
+    from controllers.console.human_input_v2.channel import IMChannelUpdatePayload
+
+    retained = {name: value if name == "provider" else {"type": "unchanged"} for name, value in payload.items()}
+    command = IMChannelUpdatePayload.model_validate({"expected_config_version": "version", "credentials": retained})
+
+    assert command.model_dump(mode="json")["credentials"] == retained
+
+
+def test_email_update_can_retain_key_while_changing_sender() -> None:
+    from controllers.console.human_input_v2.channel import EmailChannelUpdatePayload
+
+    command = EmailChannelUpdatePayload.model_validate(
+        {
+            "expected_config_version": "version",
+            "credentials": {"provider": "resend", "api_key": {"type": "unchanged"}},
+            "sender_name": "New Sender",
+            "sender_email": {"type": "unchanged"},
+        }
+    )
+
+    assert command.model_dump(mode="json")["credentials"]["api_key"] == {"type": "unchanged"}
+
+
+def test_update_distinguishes_clearing_optional_secret_from_retaining_it() -> None:
+    from controllers.console.human_input_v2.channel import IMChannelUpdatePayload
+
+    command = IMChannelUpdatePayload.model_validate(
+        {
+            "expected_config_version": "version",
+            "credentials": {
+                "provider": "feishu",
+                "app_id": {"type": "unchanged"},
+                "app_secret": "rotated-secret",
+                "verification_token": {"type": "unchanged"},
+                "encrypt_key": None,
+            },
+        }
+    )
+
+    assert command.model_dump(mode="json")["credentials"]["encrypt_key"] is None
+
+
 type _IMCredentialsDTO = (
     FeishuCredentialsInput
     | LarkCredentialsInput
@@ -167,15 +212,33 @@ def test_slack_app_token_is_optional_and_documented_for_socket_mode() -> None:
     )
 
 
-def test_resend_dto_constructs_complete_owner_candidate() -> None:
+def test_resend_dto_constructs_complete_owner_credentials() -> None:
     credentials = TypeAdapter(EmailProviderCredentials).validate_python(_RESEND_PAYLOAD)
 
-    candidate = credentials.to_owner_candidate()
+    candidate = credentials.to_owner_credentials()
 
     assert isinstance(credentials, ResendCredentials)
-    assert isinstance(candidate, ResendCandidate)
     assert candidate.api_key == _RESEND_PAYLOAD["api_key"]
     assert candidate.api_key not in repr(candidate)
+
+
+@pytest.mark.parametrize("sender_name", ["", " \t "])
+def test_resend_dto_rejects_blank_sender_name(sender_name: str) -> None:
+    from controllers.console.human_input_v2.channel import EmailChannelCreatePayload
+
+    with pytest.raises(ValidationError):
+        EmailChannelCreatePayload.model_validate(
+            {"credentials": _RESEND_PAYLOAD, "sender_email": "sender@example.com", "sender_name": sender_name}
+        )
+
+
+def test_resend_dto_normalizes_sender_name_before_constructing_candidate() -> None:
+    from controllers.console.human_input_v2.channel import EmailChannelCreatePayload
+
+    command = EmailChannelCreatePayload.model_validate(
+        {"credentials": _RESEND_PAYLOAD, "sender_email": "sender@example.com", "sender_name": " Sender "}
+    )
+    assert command.to_owner_candidate().sender_name == "Sender"
 
 
 @pytest.mark.parametrize(("_dto_type", "_owner_type", "payload"), _IM_CASES)
@@ -188,9 +251,9 @@ def test_every_secret_uses_secret_str_and_is_absent_from_repr_and_logs(
     credentials = TypeAdapter(ConsoleIMProviderCredentials).validate_python(payload)
     secret_values = {value for name, value in payload.items() if name in _SECRET_FIELD_NAMES}
 
-    for name in credentials.__class__.model_fields:
+    for name, secret in credentials.model_dump().items():
         if name in _SECRET_FIELD_NAMES:
-            assert isinstance(getattr(credentials, name), (SecretStr, type(None)))
+            assert isinstance(secret, (SecretStr, type(None)))
 
     with caplog.at_level(logging.INFO):
         logging.getLogger(__name__).info("credentials=%r", credentials)
@@ -266,3 +329,89 @@ def test_missing_required_secret_is_rejected(provider: IMProvider) -> None:
 
     with pytest.raises(ValidationError):
         TypeAdapter(ConsoleIMProviderCredentials).validate_python(payload)
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "", "  ", {}, {"type": "redacted"}, {"type": "unchanged", "value": "secret"}]
+)
+def test_update_rejects_invalid_required_secret_and_malformed_markers(invalid: object) -> None:
+    from controllers.console.human_input_v2.channel import IMChannelUpdatePayload
+
+    with pytest.raises(ValidationError):
+        IMChannelUpdatePayload.model_validate(
+            {
+                "expected_config_version": "version",
+                "credentials": {
+                    "provider": "feishu",
+                    "app_id": {"type": "unchanged"},
+                    "app_secret": invalid,
+                    "verification_token": {"type": "unchanged"},
+                    "encrypt_key": {"type": "unchanged"},
+                },
+            }
+        )
+
+
+def test_update_requires_explicit_instruction_for_nullable_fields() -> None:
+    from controllers.console.human_input_v2.channel import IMChannelUpdatePayload
+
+    with pytest.raises(ValidationError):
+        IMChannelUpdatePayload.model_validate(
+            {
+                "expected_config_version": "version",
+                "credentials": {"provider": "feishu", "app_id": "id", "app_secret": "secret"},
+            }
+        )
+
+
+@pytest.mark.parametrize("operation", ["create", "test", "replacement"])
+def test_new_credentials_never_accept_retention_markers(operation: str) -> None:
+    from controllers.console.human_input_v2.channel import (
+        IMChannelCreatePayload,
+        IMChannelReplacementPayload,
+        IMChannelTestPayload,
+    )
+
+    model = {
+        "create": IMChannelCreatePayload,
+        "test": IMChannelTestPayload,
+        "replacement": IMChannelReplacementPayload,
+    }[operation]
+    payload: dict[str, object] = {
+        "credentials": {"provider": "feishu", "app_id": "id", "app_secret": {"type": "unchanged"}}
+    }
+    if operation == "replacement":
+        payload["expected_config_version"] = "version"
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize("agent_id", ["agent-id", "00123", "0"])
+def test_wecom_update_does_not_validate_agent_id_format(agent_id: str) -> None:
+    from controllers.console.human_input_v2.provider_updates import WeComCredentialsUpdateInput
+
+    credentials = WeComCredentialsUpdateInput.model_validate(
+        {
+            "provider": "we_com",
+            "corp_id": {"type": "unchanged"},
+            "agent_id": agent_id,
+            "secret": {"type": "unchanged"},
+        }
+    )
+
+    assert credentials.to_owner_update().agent_id == agent_id
+
+
+def test_email_sender_settings_are_top_level_and_independent_of_credentials() -> None:
+    from controllers.console.human_input_v2.channel import EmailChannelCreatePayload
+
+    payload = {
+        "sender_email": "sender@example.com",
+        "sender_name": "Sender",
+        "credentials": {"provider": "resend", "api_key": "private-api-key"},
+    }
+    command = EmailChannelCreatePayload.model_validate(payload)
+    assert command.model_dump(mode="json")["sender_email"] == "sender@example.com"
+    assert command.model_dump(mode="json")["sender_name"] == "Sender"
+    assert "sender_email" not in command.model_dump(mode="json")["credentials"]
+    assert "sender_name" not in command.model_dump(mode="json")["credentials"]

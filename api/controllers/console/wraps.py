@@ -8,21 +8,20 @@ from typing import Any, Concatenate, Protocol, cast, overload
 from flask import abort, request
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
-from werkzeug.exceptions import Forbidden, UnprocessableEntity
+from werkzeug.exceptions import Forbidden, ServiceUnavailable, UnprocessableEntity
 
 from configs import dify_config
-from controllers.common.wraps import (
-    RBACPermission,
-    RBACResourceScope,
-    rbac_permission_required,
-)
+from controllers.common.rbac import RBACPermission, RBACResourceScope
+from controllers.common.wraps import rbac_permission_required
 from controllers.console.auth.error import AuthenticationFailedError, EmailCodeError
+from controllers.console.error import PaidPlanRequiredError
 from controllers.console.workspace.error import AccountNotInitializedError
 from enums import CloudPlan, DeploymentEdition
 from extensions.ext_application_services import application_services
 from extensions.ext_database import db
 from extensions.ext_redis import redis_client
 from libs.encryption import FieldEncryption
+from libs.external_api import document_errors
 from libs.login import current_account_with_tenant
 from models import Account
 from models.account import AccountStatus
@@ -30,6 +29,7 @@ from models.dataset import RateLimitLog
 from models.model import DifySetup
 from services.billing_service import BillingService
 from services.entities.feature_entities import LicenseStatus
+from services.errors.billing import BillingError
 from services.feature_service import FeatureService
 from services.operation_service import OperationService, UtmInfo
 from services.system_feature_service import SystemFeatureService
@@ -161,16 +161,55 @@ def only_edition_self_hosted[**P, R](view: Callable[P, R]) -> Callable[P, R]:
     return decorated
 
 
+def is_cloud_edition_billing_paid_plan(tenant_id: str) -> bool:
+    """Return whether a Cloud workspace has a paid subscription.
+
+    Keep this predicate shared with the mutation decorator so read endpoints can
+    expose an entitlement flag without rejecting Sandbox workspaces that need to
+    render an upgrade state.
+    """
+
+    try:
+        return BillingService.is_cloud_paid_plan(tenant_id)
+    except BillingError as exc:
+        raise ServiceUnavailable("Billing entitlement is temporarily unavailable.") from exc
+
+
+def evaluation_edition_required[**P, R](view: Callable[P, R]) -> Callable[P, R]:
+    @wraps(view)
+    def decorated(*args: P.args, **kwargs: P.kwargs):
+        if not SystemFeatureService.is_evaluation_enabled():
+            abort(404)
+
+        return view(*args, **kwargs)
+
+    return decorated
+
+
+def evaluation_paid_plan_required[**P, R](view: Callable[P, R]) -> Callable[P, R]:
+    """Admit an authenticated Evaluation request only for Cloud paid or self-hosted workspaces.
+
+    The caller must authenticate and initialize the account first. On success the
+    view runs unchanged; Cloud Sandbox raises 403, and billing failures raise 503.
+    """
+
+    @wraps(view)
+    def evaluation_plan_decorated(*args: P.args, **kwargs: P.kwargs):
+        if dify_config.DEPLOYMENT_EDITION == DeploymentEdition.CLOUD:
+            _, tenant_id = current_account_with_tenant()
+            if not is_cloud_edition_billing_paid_plan(tenant_id):
+                raise PaidPlanRequiredError()
+        return view(*args, **kwargs)
+
+    return document_errors(evaluation_plan_decorated, PaidPlanRequiredError)
+
+
 def cloud_edition_billing_paid_plan_required[**P, R](view: Callable[P, R]) -> Callable[P, R]:
     @wraps(view)
     def decorated(*args: P.args, **kwargs: P.kwargs):
         _, current_tenant_id = current_account_with_tenant()
-        billing_info = BillingService.get_info(current_tenant_id, exclude_vector_space=True)
-        if not billing_info["enabled"] or billing_info["subscription"]["plan"] not in (
-            CloudPlan.PROFESSIONAL,
-            CloudPlan.TEAM,
-        ):
-            abort(403, "This feature requires a paid plan.")
+        if not is_cloud_edition_billing_paid_plan(current_tenant_id):
+            raise PaidPlanRequiredError()
         return view(*args, **kwargs)
 
     return decorated
@@ -181,10 +220,10 @@ def cloud_edition_billing_resource_check[**P, R](resource: str) -> Callable[[Cal
         @wraps(view)
         def decorated(*args: P.args, **kwargs: P.kwargs):
             _, current_tenant_id = current_account_with_tenant()
-            if resource == "vector_space":
-                if dify_config.DEPLOYMENT_EDITION != DeploymentEdition.CLOUD:
-                    return view(*args, **kwargs)
+            if dify_config.DEPLOYMENT_EDITION != DeploymentEdition.CLOUD:
+                return view(*args, **kwargs)
 
+            if resource == "vector_space":
                 vector_space = application_services().feature_queries.get_workspace_vector_space(current_tenant_id)
                 if 0 < vector_space.limit <= vector_space.size:
                     abort(
@@ -194,30 +233,26 @@ def cloud_edition_billing_resource_check[**P, R](resource: str) -> Callable[[Cal
                 return view(*args, **kwargs)
 
             features = FeatureService.get_features(current_tenant_id, exclude_vector_space=True)
-            if features.billing.enabled:
-                members = features.members
-                apps = features.apps
-                documents_upload_quota = features.documents_upload_quota
-                annotation_quota_limit = features.annotation_quota_limit
-                if resource == "members" and 0 < members.limit <= members.size:
-                    abort(403, "The number of members has reached the limit of your subscription.")
-                elif resource == "apps" and 0 < apps.limit <= apps.size:
-                    abort(403, "The number of apps has reached the limit of your subscription.")
-                elif resource == "documents" and 0 < documents_upload_quota.limit <= documents_upload_quota.size:
-                    # The api of file upload is used in the multiple places,
-                    # so we need to check the source of the request from datasets
-                    source = request.args.get("source") or request.form.get("source")
-                    if source == "datasets":
-                        abort(403, "The number of documents has reached the limit of your subscription.")
-                    else:
-                        return view(*args, **kwargs)
-                elif resource == "workspace_custom" and not features.can_replace_logo:
-                    abort(403, "The workspace custom feature has reached the limit of your subscription.")
-                elif resource == "annotation" and 0 < annotation_quota_limit.limit < annotation_quota_limit.size:
-                    abort(403, "The annotation quota has reached the limit of your subscription.")
+            members = features.members
+            apps = features.apps
+            documents_upload_quota = features.documents_upload_quota
+            annotation_quota_limit = features.annotation_quota_limit
+            if resource == "members" and 0 < members.limit <= members.size:
+                abort(403, "The number of members has reached the limit of your subscription.")
+            elif resource == "apps" and 0 < apps.limit <= apps.size:
+                abort(403, "The number of apps has reached the limit of your subscription.")
+            elif resource == "documents" and 0 < documents_upload_quota.limit <= documents_upload_quota.size:
+                # The api of file upload is used in the multiple places,
+                # so we need to check the source of the request from datasets
+                source = request.args.get("source") or request.form.get("source")
+                if source == "datasets":
+                    abort(403, "The number of documents has reached the limit of your subscription.")
                 else:
                     return view(*args, **kwargs)
-
+            elif resource == "workspace_custom" and not features.can_replace_logo:
+                abort(403, "The workspace custom feature has reached the limit of your subscription.")
+            elif resource == "annotation" and 0 < annotation_quota_limit.limit < annotation_quota_limit.size:
+                abort(403, "The annotation quota has reached the limit of your subscription.")
             return view(*args, **kwargs)
 
         return decorated
@@ -232,16 +267,15 @@ def cloud_edition_billing_knowledge_limit_check[**P, R](
         @wraps(view)
         def decorated(*args: P.args, **kwargs: P.kwargs):
             _, current_tenant_id = current_account_with_tenant()
+            if dify_config.DEPLOYMENT_EDITION != DeploymentEdition.CLOUD or resource != "add_segment":
+                return view(*args, **kwargs)
+
             features = FeatureService.get_features(current_tenant_id, exclude_vector_space=True)
-            if features.billing.enabled:
-                if resource == "add_segment":
-                    if features.billing.subscription.plan == CloudPlan.SANDBOX:
-                        abort(
-                            403,
-                            "To unlock this feature and elevate your Dify experience, please upgrade to a paid plan.",
-                        )
-                else:
-                    return view(*args, **kwargs)
+            if features.billing.subscription.plan == CloudPlan.SANDBOX:
+                abort(
+                    403,
+                    "To unlock this feature and elevate your Dify experience, please upgrade to a paid plan.",
+                )
 
             return view(*args, **kwargs)
 
@@ -410,7 +444,6 @@ def knowledge_pipeline_publish_enabled[**P, R](view: Callable[P, R]) -> Callable
 def edit_permission_required[**P, R](f: Callable[P, R]) -> Callable[P, R]:
     @wraps(f)
     def decorated_function(*args: P.args, **kwargs: P.kwargs):
-
         from libs.login import current_user
 
         if not dify_config.RBAC_ENABLED:
@@ -427,7 +460,6 @@ def edit_permission_required[**P, R](f: Callable[P, R]) -> Callable[P, R]:
 def is_admin_or_owner_required[**P, R](f: Callable[P, R]) -> Callable[P, R]:
     @wraps(f)
     def decorated_function(*args: P.args, **kwargs: P.kwargs):
-
         from libs.login import current_user
 
         if not dify_config.RBAC_ENABLED:
@@ -437,94 +469,6 @@ def is_admin_or_owner_required[**P, R](f: Callable[P, R]) -> Callable[P, R]:
         return f(*args, **kwargs)
 
     return decorated_function
-
-
-def annotation_import_rate_limit[**P, R](view: Callable[P, R]) -> Callable[P, R]:
-    """
-    Rate limiting decorator for annotation import operations.
-
-    Implements sliding window rate limiting with two tiers:
-    - Short-term: Configurable requests per minute (default: 5)
-    - Long-term: Configurable requests per hour (default: 20)
-
-    Uses Redis ZSET for distributed rate limiting across multiple instances.
-    """
-
-    @wraps(view)
-    def decorated(*args: P.args, **kwargs: P.kwargs):
-        _, current_tenant_id = current_account_with_tenant()
-        current_time = int(time.time() * 1000)
-
-        # Check per-minute rate limit
-        minute_key = f"annotation_import_rate_limit:{current_tenant_id}:1min"
-        redis_client.zadd(minute_key, {current_time: current_time})
-        redis_client.zremrangebyscore(minute_key, 0, current_time - 60000)
-        minute_count = redis_client.zcard(minute_key)
-        redis_client.expire(minute_key, 120)  # 2 minutes TTL
-
-        if minute_count > dify_config.ANNOTATION_IMPORT_RATE_LIMIT_PER_MINUTE:
-            abort(
-                429,
-                f"Too many annotation import requests. Maximum {dify_config.ANNOTATION_IMPORT_RATE_LIMIT_PER_MINUTE} "
-                f"requests per minute allowed. Please try again later.",
-            )
-
-        # Check per-hour rate limit
-        hour_key = f"annotation_import_rate_limit:{current_tenant_id}:1hour"
-        redis_client.zadd(hour_key, {current_time: current_time})
-        redis_client.zremrangebyscore(hour_key, 0, current_time - 3600000)
-        hour_count = redis_client.zcard(hour_key)
-        redis_client.expire(hour_key, 7200)  # 2 hours TTL
-
-        if hour_count > dify_config.ANNOTATION_IMPORT_RATE_LIMIT_PER_HOUR:
-            abort(
-                429,
-                f"Too many annotation import requests. Maximum {dify_config.ANNOTATION_IMPORT_RATE_LIMIT_PER_HOUR} "
-                f"requests per hour allowed. Please try again later.",
-            )
-
-        return view(*args, **kwargs)
-
-    return decorated
-
-
-def annotation_import_concurrency_limit[**P, R](view: Callable[P, R]) -> Callable[P, R]:
-    """
-    Concurrency control decorator for annotation import operations.
-
-    Limits the number of concurrent import tasks per tenant to prevent
-    resource exhaustion and ensure fair resource allocation.
-
-    Uses Redis ZSET to track active import jobs with automatic cleanup
-    of stale entries (jobs older than 2 minutes).
-    """
-
-    @wraps(view)
-    def decorated(*args: P.args, **kwargs: P.kwargs):
-        _, current_tenant_id = current_account_with_tenant()
-        current_time = int(time.time() * 1000)
-
-        active_jobs_key = f"annotation_import_active:{current_tenant_id}"
-
-        # Clean up stale entries (jobs that should have completed or timed out)
-        stale_threshold = current_time - 120000  # 2 minutes ago
-        redis_client.zremrangebyscore(active_jobs_key, 0, stale_threshold)
-
-        # Check current active job count
-        active_count = redis_client.zcard(active_jobs_key)
-
-        if active_count >= dify_config.ANNOTATION_IMPORT_MAX_CONCURRENT:
-            abort(
-                429,
-                f"Too many concurrent import tasks. Maximum {dify_config.ANNOTATION_IMPORT_MAX_CONCURRENT} "
-                f"concurrent imports allowed per workspace. Please wait for existing imports to complete.",
-            )
-
-        # Allow the request to proceed
-        # The actual job registration will happen in the service layer
-        return view(*args, **kwargs)
-
-    return decorated
 
 
 def _decrypt_field(field_name: str, error_class: type[Exception], error_message: str) -> None:
@@ -659,6 +603,10 @@ def with_current_user_id[T, **P, R](
 def validate_request[M: BaseModel](model: type[M]) -> M:
     """Parse and validate the current request without exposing submitted values."""
 
+    # TODO: Standardize request parsing and structured validation errors after
+    # auditing callers. Malformed or falsy JSON currently becomes {}, allowing
+    # optional payloads to succeed as no-ops; validation details currently travel
+    # as a JSON string in the error message.
     if request.method == "GET":
         raw = request.args.to_dict(flat=True)
     elif request.method == "DELETE":

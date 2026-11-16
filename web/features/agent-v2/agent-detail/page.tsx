@@ -1,8 +1,10 @@
 'use client'
 
 import type { AgentDetailSectionKey } from './section'
+import { AgentAccessConfigPage } from './access-config/page'
 import { AgentAccessPage } from './access/page'
 import { AgentConfigurePage } from './configure/page'
+import { AgentEvaluationPage } from './evaluation/page'
 import { AgentLogsPage } from './logs/page'
 import { AgentMonitoringPage } from './monitoring/page'
 
@@ -12,6 +14,10 @@ type AgentDetailPageProps = {
 }
 
 export function AgentDetailPage({ agentId, section }: AgentDetailPageProps) {
+  if (section === 'access-config') return <AgentAccessConfigPage agentId={agentId} />
+
+  if (section === 'evaluation') return <AgentEvaluationPage agentId={agentId} />
+
   if (section === 'monitoring') return <AgentMonitoringPage agentId={agentId} />
 
   if (section === 'logs') return <AgentLogsPage agentId={agentId} />

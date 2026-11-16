@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import fields
 from datetime import datetime
+from typing import override
 
 import pytest
 from lark_oapi.core.exception import EventException
@@ -70,7 +71,8 @@ class _RecordingConsumer:
         self._acceptance = acceptance
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self._trace.append("consumer")
         self.events.append(event)
         return self._acceptance
@@ -83,7 +85,8 @@ class _BlockingConsumer:
         self.release = threading.Event()
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self._trace.append("consumer-start")
         self.events.append(event)
         self.entered.set()
@@ -96,7 +99,8 @@ class _FailingConsumer:
     def __init__(self) -> None:
         self.attempts = 0
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         del event
         self.attempts += 1
         raise RuntimeError("sensitive consumer details")
@@ -139,7 +143,7 @@ class _FakeStreamClient:
 class _DispatcherStreamClient:
     def __init__(
         self,
-        credentials: FeishuCredentials,
+        credentials: FeishuCredentials | LarkCredentials,
         domain: str,
         callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
         payload: bytes,
@@ -170,6 +174,7 @@ class _BlockingCloseStreamClient(_FakeStreamClient):
         self.close_started = threading.Event()
         self.release_close = threading.Event()
 
+    @override
     def stop(self) -> None:
         self.stop_calls += 1
         self._trace.append("sdk-stop-start")
@@ -188,6 +193,7 @@ class _BlockingFailingCloseStreamClient(_BlockingCloseStreamClient):
         super().__init__(callback, trace)
         self._sensitive_marker = sensitive_marker
 
+    @override
     def stop(self) -> None:
         self.stop_calls += 1
         self._trace.append("sdk-stop-start")
@@ -207,6 +213,7 @@ class _BlockingStartStreamClient(_FakeStreamClient):
         self.start_entered = threading.Event()
         self.cancel_start = threading.Event()
 
+    @override
     def start(self) -> None:
         self.start_calls += 1
         self._trace.append("sdk-start")
@@ -214,6 +221,7 @@ class _BlockingStartStreamClient(_FakeStreamClient):
         assert self.cancel_start.wait(timeout=2)
         raise RuntimeError("sensitive cancelled start details")
 
+    @override
     def stop(self) -> None:
         self.stop_calls += 1
         self._trace.append("sdk-stop")
@@ -233,6 +241,7 @@ class _DeferredWireAckStreamClient(_FakeStreamClient):
         self.release_ack_write = threading.Event()
         self.ack_written = threading.Event()
 
+    @override
     def emit(self, event: Mapping[str, object], *, ack_error: Exception | None = None) -> None:
         del ack_error
         acknowledged = False
@@ -249,6 +258,7 @@ class _DeferredWireAckStreamClient(_FakeStreamClient):
             self._trace.append("ack-written")
             self.ack_written.set()
 
+    @override
     def stop(self) -> None:
         self.stop_calls += 1
         assert self.ack_written.wait(timeout=2)
@@ -321,6 +331,19 @@ def _sdk_transport_envelope(event: Mapping[str, object]) -> adapter_module._SDKE
     )
 
 
+def _credentials(provider: IMProvider) -> FeishuCredentials | LarkCredentials:
+    values = {
+        "provider": provider,
+        "app_id": "cli_sanitized_app",
+        "app_secret": "sanitized-app-secret",
+        "verification_token": "sanitized-verification-token",
+        "encrypt_key": "sanitized-encrypt-key",
+    }
+    if provider is IMProvider.FEISHU:
+        return FeishuCredentials.model_validate(values)
+    return LarkCredentials.model_validate(values)
+
+
 def _adapter(
     monkeypatch: pytest.MonkeyPatch,
     provider: IMProvider,
@@ -338,7 +361,13 @@ def _adapter(
     return LarkIMProviderAdapter(LarkCredentials.model_validate(values))
 
 
-def test_per_client_sdk_transport_owns_and_closes_its_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("provider", "domain"),
+    [(IMProvider.FEISHU, "https://open.feishu.cn"), (IMProvider.LARK, "https://open.larksuite.com")],
+)
+def test_per_client_sdk_transport_owns_and_closes_its_loop(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider, domain: str
+) -> None:
     from lark_oapi.ws import client as sdk_ws_client_module
 
     transport_connected = threading.Event()
@@ -368,15 +397,9 @@ def test_per_client_sdk_transport_owns_and_closes_its_loop(monkeypatch: pytest.M
     )
     monkeypatch.setattr(sdk_ws_client_module.websockets, "connect", connect)
     client = adapter_module._PerClientSDKWSClient(
-        credentials=FeishuCredentials(
-            provider=IMProvider.FEISHU,
-            app_id="cli_sanitized_app",
-            app_secret="sanitized-app-secret",
-            verification_token="sanitized-verification-token",
-            encrypt_key="sanitized-encrypt-key",
-        ),
-        domain="https://open.feishu.cn",
-        event_handler=object(),
+        credentials=_credentials(provider),
+        domain=domain,
+        event_handler=adapter_module.lark.EventDispatcherHandler.builder("", "").build(),
     )
     start_errors: list[Exception] = []
 
@@ -406,7 +429,11 @@ def test_factory_is_lazy_and_start_returns_only_after_sdk_ready(
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
 
-    def factory(_credentials, _domain, callback):
+    def factory(
+        _credentials: FeishuCredentials | LarkCredentials,
+        _domain: str,
+        callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> _FakeStreamClient:
         client = _FakeStreamClient(callback, trace)
         clients.append(client)
         return client
@@ -425,7 +452,13 @@ def test_factory_is_lazy_and_start_returns_only_after_sdk_ready(
     stream.stop()
 
 
+@pytest.mark.parametrize(
+    ("provider", "domain"),
+    [(IMProvider.FEISHU, "https://open.feishu.cn"), (IMProvider.LARK, "https://open.larksuite.com")],
+)
 def test_official_stream_client_start_returns_after_channel_readiness(
+    provider: IMProvider,
+    domain: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class LoopBoundReadyChannel:
@@ -455,14 +488,8 @@ def test_official_stream_client_start_returns_after_channel_readiness(
     channels: list[LoopBoundReadyChannel] = []
     monkeypatch.setattr(adapter_module, "_SynchronousEventChannel", LoopBoundReadyChannel)
     client = adapter_module._OfficialSDKStreamClient(
-        FeishuCredentials(
-            provider=IMProvider.FEISHU,
-            app_id="cli_sanitized_app",
-            app_secret="sanitized-app-secret",
-            verification_token="sanitized-verification-token",
-            encrypt_key="sanitized-encrypt-key",
-        ),
-        "https://open.feishu.cn",
+        _credentials(provider),
+        domain,
         lambda _event, _acknowledge: None,
     )
     channel = channels[0]
@@ -480,15 +507,15 @@ def test_official_stream_client_start_returns_after_channel_readiness(
     assert not start_thread.is_alive()
 
 
-def test_private_sdk_dispatcher_seam_keeps_consumer_acceptance_as_ack_boundary() -> None:
+@pytest.mark.parametrize(
+    ("provider", "domain"),
+    [(IMProvider.FEISHU, "https://open.feishu.cn"), (IMProvider.LARK, "https://open.larksuite.com")],
+)
+def test_private_sdk_dispatcher_seam_keeps_consumer_acceptance_as_ack_boundary(
+    provider: IMProvider, domain: str
+) -> None:
     observed: list[adapter_module._SDKEventEnvelope] = []
-    credentials = FeishuCredentials(
-        provider=IMProvider.FEISHU,
-        app_id="cli_sanitized_app",
-        app_secret="sanitized-app-secret",
-        verification_token="sanitized-verification-token",
-        encrypt_key="sanitized-encrypt-key",
-    )
+    credentials = _credentials(provider)
 
     def accept(event: adapter_module._SDKEventEnvelope, acknowledge: Callable[[], None]) -> None:
         observed.append(event)
@@ -496,7 +523,7 @@ def test_private_sdk_dispatcher_seam_keeps_consumer_acceptance_as_ack_boundary()
 
     channel = adapter_module._SynchronousEventChannel(
         credentials=credentials,
-        domain="https://open.feishu.cn",
+        domain=domain,
         callback=accept,
     )
     dispatcher = channel._build_dispatcher()
@@ -529,7 +556,7 @@ def test_private_sdk_dispatcher_seam_keeps_consumer_acceptance_as_ack_boundary()
 
     rejecting_channel = adapter_module._SynchronousEventChannel(
         credentials=credentials,
-        domain="https://open.feishu.cn",
+        domain=domain,
         callback=lambda _event, _acknowledge: None,
     )
     with pytest.raises(RuntimeError, match="responsibility was not accepted"):
@@ -558,7 +585,9 @@ def test_sdk_event_envelope_preserves_native_payload_without_parsing(
     )
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_card_dispatcher_preserves_native_payload_without_event_stream_parsing(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload_mapping = _event_payload()
@@ -567,7 +596,11 @@ def test_card_dispatcher_preserves_native_payload_without_event_stream_parsing(
     assert isinstance(expected_native_payload, str)
     clients: list[_DispatcherStreamClient] = []
 
-    def create_client(credentials, domain: str, callback):
+    def create_client(
+        credentials: FeishuCredentials | LarkCredentials,
+        domain: str,
+        callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> _DispatcherStreamClient:
         client = _DispatcherStreamClient(credentials, domain, callback, payload)
         clients.append(client)
         return client
@@ -579,7 +612,7 @@ def test_card_dispatcher_preserves_native_payload_without_event_stream_parsing(
 
     monkeypatch.setattr(adapter_module, "_decode_json_object", fail_on_native_payload_parse)
     consumer = _RecordingConsumer([])
-    adapter = _adapter(monkeypatch, IMProvider.FEISHU)
+    adapter = _adapter(monkeypatch, provider)
     stream = adapter.create_stream_handler(consumer)
 
     try:
@@ -597,15 +630,13 @@ def test_card_dispatcher_preserves_native_payload_without_event_stream_parsing(
     assert _CARD_ACTION_TRIGGER_OBJECT_TYPE not in event.payload
 
 
-def test_message_dispatcher_rejects_unregistered_message_event() -> None:
+@pytest.mark.parametrize(
+    ("provider", "domain"),
+    [(IMProvider.FEISHU, "https://open.feishu.cn"), (IMProvider.LARK, "https://open.larksuite.com")],
+)
+def test_message_dispatcher_rejects_unregistered_message_event(provider: IMProvider, domain: str) -> None:
     observed: list[adapter_module._SDKEventEnvelope] = []
-    credentials = FeishuCredentials(
-        provider=IMProvider.FEISHU,
-        app_id="cli_sanitized_app",
-        app_secret="sanitized-app-secret",
-        verification_token="sanitized-verification-token",
-        encrypt_key="sanitized-encrypt-key",
-    )
+    credentials = _credentials(provider)
 
     def accept(event: adapter_module._SDKEventEnvelope, acknowledge: Callable[[], None]) -> None:
         observed.append(event)
@@ -613,7 +644,7 @@ def test_message_dispatcher_rejects_unregistered_message_event() -> None:
 
     channel = adapter_module._SynchronousEventChannel(
         credentials=credentials,
-        domain="https://open.feishu.cn",
+        domain=domain,
         callback=accept,
     )
     payload = json.dumps(_message_event_payload(), ensure_ascii=False, separators=(",", ":")).encode()
@@ -625,17 +656,15 @@ def test_message_dispatcher_rejects_unregistered_message_event() -> None:
     assert observed == []
 
 
-def test_private_sdk_write_seam_tracks_wire_ack_completion() -> None:
-    credentials = FeishuCredentials(
-        provider=IMProvider.FEISHU,
-        app_id="cli_sanitized_app",
-        app_secret="sanitized-app-secret",
-        verification_token="sanitized-verification-token",
-        encrypt_key="sanitized-encrypt-key",
-    )
+@pytest.mark.parametrize(
+    ("provider", "domain"),
+    [(IMProvider.FEISHU, "https://open.feishu.cn"), (IMProvider.LARK, "https://open.larksuite.com")],
+)
+def test_private_sdk_write_seam_tracks_wire_ack_completion(provider: IMProvider, domain: str) -> None:
+    credentials = _credentials(provider)
     channel = adapter_module._SynchronousEventChannel(
         credentials=credentials,
-        domain="https://open.feishu.cn",
+        domain=domain,
         callback=lambda _event, acknowledge: acknowledge(),
     )
 
@@ -675,7 +704,8 @@ def test_private_sdk_write_seam_tracks_wire_ack_completion() -> None:
     asyncio.run(exercise())
 
 
-def test_accepted_event_is_consumed_once_then_acked(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_accepted_event_is_consumed_once_then_acked(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -684,14 +714,14 @@ def test_accepted_event_is_consumed_once_then_acked(monkeypatch: pytest.MonkeyPa
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _RecordingConsumer(trace)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
 
     clients[0].emit(_event_payload())
 
     assert trace[-2:] == ["consumer", "ack"]
     assert len(consumer.events) == 1
-    assert consumer.events[0].provider is IMProvider.FEISHU
+    assert consumer.events[0].provider is provider
     assert consumer.events[0].provider_tenant_id == "tenant_sanitized"
     assert consumer.events[0].ingress_kind is IMEventIngressKind.STREAM
     persisted_callback = json.loads(consumer.events[0].payload)
@@ -710,7 +740,9 @@ def test_accepted_event_is_consumed_once_then_acked(monkeypatch: pytest.MonkeyPa
     ],
     ids=("microseconds", "milliseconds", "malformed", "overflow"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_stream_event_maps_confirmed_timestamp_units_safely(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     create_time: str,
     expected: datetime | None,
@@ -723,7 +755,7 @@ def test_stream_event_maps_confirmed_timestamp_units_safely(
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _RecordingConsumer(trace)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
 
     clients[0].emit(_event_payload(create_time=create_time))
@@ -737,7 +769,9 @@ def test_stream_event_maps_confirmed_timestamp_units_safely(
     "acceptance",
     [EventAcceptance.NOT_ACCEPTED],
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_unaccepted_event_is_not_acked_or_replayed(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     acceptance: EventAcceptance,
 ) -> None:
@@ -749,7 +783,7 @@ def test_unaccepted_event_is_not_acked_or_replayed(
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _RecordingConsumer(trace, acceptance)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
 
     clients[0].emit(_event_payload())
@@ -759,7 +793,10 @@ def test_unaccepted_event_is_not_acked_or_replayed(
     stream.stop()
 
 
-def test_consumer_exception_is_contained_without_ack_or_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_consumer_exception_is_contained_without_ack_or_replay(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -768,7 +805,7 @@ def test_consumer_exception_is_contained_without_ack_or_replay(monkeypatch: pyte
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _FailingConsumer()
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
 
     clients[0].emit(_event_payload())
@@ -779,7 +816,8 @@ def test_consumer_exception_is_contained_without_ack_or_replay(monkeypatch: pyte
     assert clients[0].stop_calls == 1
 
 
-def test_stop_drains_consumer_and_ack_before_sdk_close(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_drains_consumer_and_ack_before_sdk_close(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -788,7 +826,7 @@ def test_stop_drains_consumer_and_ack_before_sdk_close(monkeypatch: pytest.Monke
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _BlockingConsumer(trace)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
     callback_thread = threading.Thread(target=clients[0].emit, args=(_event_payload(),))
     callback_thread.start()
@@ -810,7 +848,10 @@ def test_stop_drains_consumer_and_ack_before_sdk_close(monkeypatch: pytest.Monke
     assert trace[-5:] == ["consumer-start", "consumer-end", "ack", "sdk-stop", "stop-return"]
 
 
-def test_stop_waits_for_sdk_wire_ack_after_dispatcher_callback_returns(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_waits_for_sdk_wire_ack_after_dispatcher_callback_returns(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     clients: list[_DeferredWireAckStreamClient] = []
     monkeypatch.setattr(
@@ -820,7 +861,7 @@ def test_stop_waits_for_sdk_wire_ack_after_dispatcher_callback_returns(monkeypat
             clients.append(_DeferredWireAckStreamClient(callback, trace)) or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     stream.start()
     emit_thread = threading.Thread(target=clients[0].emit, args=(_event_payload(),))
     emit_thread.start()
@@ -840,7 +881,8 @@ def test_stop_waits_for_sdk_wire_ack_after_dispatcher_callback_returns(monkeypat
     assert trace.index("ack-written") < trace.index("sdk-stop") < trace.index("stop-return")
 
 
-def test_callback_after_stop_never_consumes_or_acks(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_callback_after_stop_never_consumes_or_acks(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -849,7 +891,7 @@ def test_callback_after_stop_never_consumes_or_acks(monkeypatch: pytest.MonkeyPa
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _RecordingConsumer(trace)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
     stream.stop()
 
@@ -860,7 +902,10 @@ def test_callback_after_stop_never_consumes_or_acks(monkeypatch: pytest.MonkeyPa
     assert clients[0].stop_calls == 1
 
 
-def test_concurrent_repeated_stop_waits_for_the_single_sdk_close(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_concurrent_repeated_stop_waits_for_the_single_sdk_close(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     clients: list[_BlockingCloseStreamClient] = []
     monkeypatch.setattr(
@@ -870,7 +915,7 @@ def test_concurrent_repeated_stop_waits_for_the_single_sdk_close(monkeypatch: py
             clients.append(_BlockingCloseStreamClient(callback, trace)) or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     stream.start()
     first_returned = threading.Event()
     second_returned = threading.Event()
@@ -899,10 +944,14 @@ def test_concurrent_repeated_stop_waits_for_the_single_sdk_close(monkeypatch: py
     assert clients[0].stop_calls == 1
 
 
-def test_stop_surfaces_operator_safe_error_when_sdk_close_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_surfaces_operator_safe_error_when_sdk_close_fails(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     sensitive_marker = "sensitive SDK close details"
 
     class CloseFailingStreamClient(_FakeStreamClient):
+        @override
         def stop(self) -> None:
             self.stop_calls += 1
             raise RuntimeError(sensitive_marker)
@@ -916,7 +965,7 @@ def test_stop_surfaces_operator_safe_error_when_sdk_close_fails(monkeypatch: pyt
             clients.append(CloseFailingStreamClient(callback, trace)) or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     stream.start()
 
     with pytest.raises(IMStreamStopError) as stop_error:
@@ -926,7 +975,10 @@ def test_stop_surfaces_operator_safe_error_when_sdk_close_fails(monkeypatch: pyt
     assert clients[0].stop_calls == 1
 
 
-def test_failed_close_propagates_to_concurrent_and_repeated_stop_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_failed_close_propagates_to_concurrent_and_repeated_stop_calls(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     sensitive_marker = "sensitive concurrent SDK close details"
     trace: list[str] = []
     clients: list[_BlockingFailingCloseStreamClient] = []
@@ -937,7 +989,7 @@ def test_failed_close_propagates_to_concurrent_and_repeated_stop_calls(monkeypat
             clients.append(_BlockingFailingCloseStreamClient(callback, trace, sensitive_marker)) or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     stream.start()
     errors: list[IMStreamStopError | None] = [None, None]
     returned = [threading.Event(), threading.Event()]
@@ -978,7 +1030,10 @@ def test_failed_close_propagates_to_concurrent_and_repeated_stop_calls(monkeypat
     assert trace[-2:] == ["sdk-stop-start", "sdk-stop-failed"]
 
 
-def test_stop_during_start_closes_client_and_both_calls_finish(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_during_start_closes_client_and_both_calls_finish(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     clients: list[_BlockingStartStreamClient] = []
     monkeypatch.setattr(
@@ -988,7 +1043,7 @@ def test_stop_during_start_closes_client_and_both_calls_finish(monkeypatch: pyte
             clients.append(_BlockingStartStreamClient(callback, trace)) or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     start_errors: list[IMStreamStartError] = []
 
     def start_stream() -> None:
@@ -1013,7 +1068,10 @@ def test_stop_during_start_closes_client_and_both_calls_finish(monkeypatch: pyte
     assert trace == ["sdk-start", "sdk-stop"]
 
 
-def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     factory_entered = threading.Event()
     release_factory = threading.Event()
@@ -1031,7 +1089,11 @@ def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(monkeypatch: pytes
             assert release_close.wait(timeout=2)
             trace.append("sdk-close-end")
 
-    def factory(_credentials, _domain, _callback):
+    def factory(
+        _credentials: FeishuCredentials | LarkCredentials,
+        _domain: str,
+        _callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> SlowCloseClient:
         trace.append("factory-enter")
         factory_entered.set()
         assert release_factory.wait(timeout=2)
@@ -1044,6 +1106,7 @@ def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(monkeypatch: pytes
             self.blocked_thread: threading.Thread | None = None
             self._blocked_once = False
 
+        @override
         def wait(self, timeout: float | None = None) -> bool:
             if threading.current_thread() is self.blocked_thread and not self._blocked_once:
                 stop_waiting_for_client.set()
@@ -1058,7 +1121,7 @@ def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(monkeypatch: pytes
             return result
 
     monkeypatch.setattr(adapter_module, "_create_sdk_stream_client", factory)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
     condition = ResumeStopAfterCloseClaim()
     stream._condition = condition
     start_errors: list[IMStreamStartError] = []
@@ -1098,7 +1161,8 @@ def test_stop_waits_when_failed_start_claims_a_slow_sdk_close(monkeypatch: pytes
     assert trace.index("sdk-close-end") < trace.index("stop-return")
 
 
-def test_stop_before_start_prevents_client_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_stop_before_start_prevents_client_construction(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -1106,7 +1170,7 @@ def test_stop_before_start_prevents_client_construction(monkeypatch: pytest.Monk
         "_create_sdk_stream_client",
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
 
     stream.stop()
     with pytest.raises(IMStreamStartError):
@@ -1122,7 +1186,11 @@ def test_stream_wrappers_have_equivalent_observable_lifecycle_traces(monkeypatch
     }
     clients: dict[str, _FakeStreamClient] = {}
 
-    def factory(_credentials, domain, callback):
+    def factory(
+        _credentials: FeishuCredentials | LarkCredentials,
+        domain: str,
+        callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> _FakeStreamClient:
         client = _FakeStreamClient(callback, traces[domain])
         clients[domain] = client
         return client
@@ -1154,7 +1222,10 @@ def test_stream_wrappers_have_equivalent_observable_lifecycle_traces(monkeypatch
     assert observed_providers == [IMProvider.FEISHU, IMProvider.LARK]
 
 
-def test_start_failure_closes_partial_client_and_is_operator_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_start_failure_closes_partial_client_and_is_operator_safe(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     sensitive_marker = "sensitive SDK credential details"
@@ -1166,7 +1237,7 @@ def test_start_failure_closes_partial_client_and_is_operator_safe(monkeypatch: p
             or clients[-1]
         ),
     )
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(_RecordingConsumer(trace))
+    stream = _adapter(monkeypatch, provider).create_stream_handler(_RecordingConsumer(trace))
 
     with pytest.raises(IMStreamStartError) as stream_error:
         stream.start()
@@ -1179,7 +1250,8 @@ def test_start_failure_closes_partial_client_and_is_operator_safe(monkeypatch: p
     assert len(clients) == 1
 
 
-def test_ack_failure_is_contained_and_stop_still_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_ack_failure_is_contained_and_stop_still_closes(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -1188,7 +1260,7 @@ def test_ack_failure_is_contained_and_stop_still_closes(monkeypatch: pytest.Monk
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
     consumer = _RecordingConsumer(trace)
-    stream = _adapter(monkeypatch, IMProvider.FEISHU).create_stream_handler(consumer)
+    stream = _adapter(monkeypatch, provider).create_stream_handler(consumer)
     stream.start()
 
     clients[0].emit(_event_payload(), ack_error=RuntimeError("sensitive ACK details"))
@@ -1198,7 +1270,8 @@ def test_ack_failure_is_contained_and_stop_still_closes(monkeypatch: pytest.Monk
     assert clients[0].stop_calls == 1
 
 
-def test_root_close_does_not_stop_created_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_root_close_does_not_stop_created_stream(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -1206,7 +1279,7 @@ def test_root_close_does_not_stop_created_stream(monkeypatch: pytest.MonkeyPatch
         "_create_sdk_stream_client",
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
-    adapter = _adapter(monkeypatch, IMProvider.FEISHU)
+    adapter = _adapter(monkeypatch, provider)
     consumer = _RecordingConsumer(trace)
     stream = adapter.create_stream_handler(consumer)
     adapter.close()
@@ -1218,7 +1291,8 @@ def test_root_close_does_not_stop_created_stream(monkeypatch: pytest.MonkeyPatch
     assert len(consumer.events) == 1
 
 
-def test_two_streams_have_independent_lifecycles(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_two_streams_have_independent_lifecycles(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     trace: list[str] = []
     clients: list[_FakeStreamClient] = []
     monkeypatch.setattr(
@@ -1226,7 +1300,7 @@ def test_two_streams_have_independent_lifecycles(monkeypatch: pytest.MonkeyPatch
         "_create_sdk_stream_client",
         lambda _credentials, _domain, callback: clients.append(_FakeStreamClient(callback, trace)) or clients[-1],
     )
-    adapter = _adapter(monkeypatch, IMProvider.FEISHU)
+    adapter = _adapter(monkeypatch, provider)
     first_consumer = _RecordingConsumer(trace)
     second_consumer = _RecordingConsumer(trace)
     first = adapter.create_stream_handler(first_consumer)

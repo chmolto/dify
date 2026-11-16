@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Generator
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime
-from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -18,12 +16,8 @@ from sqlalchemy.orm import Session
 
 from core.human_input_v2.entities import EmailProviderType, IMProvider
 from core.human_input_v2.shared import AccountId, TenantId
-from models.human_input_v2 import (
-    HumanInputEmailProvider,
-    HumanInputIMChannel,
-    IMEncryptedCredentials,
-    ResendEmailProviderEncryptedCredentials,
-)
+from models.human_input_v2 import HumanInputEmailProvider, HumanInputIMChannel
+from repositories.human_input_v2.channel_credentials import ChannelEncryptedCredentials
 from repositories.human_input_v2.im_channel_repository import (
     IMChannel,
     IMChannelAlreadyConfiguredError,
@@ -51,19 +45,8 @@ _OwnerKind = Literal["workspace", "deployment"]
 
 
 @pytest.fixture
-def channel_engine(tmp_path: Path) -> Generator[Engine, None, None]:
-    database_path = tmp_path / "im-channel.sqlite3"
-    engine = sa.create_engine(f"sqlite:///{database_path}")
-    channel_table = HumanInputIMChannel.metadata.tables[HumanInputIMChannel.__tablename__]
-    email_table = HumanInputEmailProvider.metadata.tables[HumanInputEmailProvider.__tablename__]
-    HumanInputIMChannel.metadata.create_all(
-        engine,
-        tables=[channel_table, email_table],
-    )
-    try:
-        yield engine
-    finally:
-        engine.dispose()
+def channel_engine(sqlite_engine: Engine) -> Engine:
+    return sqlite_engine
 
 
 def _channel(
@@ -84,7 +67,7 @@ def _channel(
         updated_at=updated_at,
         provider=provider,
         provider_tenant_id=f"provider-tenant-{index}",
-        encrypted_credentials=IMEncryptedCredentials(ciphertext=f"opaque-ciphertext-{index}"),
+        encrypted_credentials=ChannelEncryptedCredentials(ciphertext=f"opaque-ciphertext-{index}"),
         app_identifier=app_identifier or f"app-{index}",
         webhook_id=WebhookId(f"{webhook_index if webhook_index is not None else index:032x}"),
         config_version=version,
@@ -130,9 +113,9 @@ def _pending_email_configuration() -> HumanInputEmailProvider:
     return HumanInputEmailProvider(
         provider=EmailProviderType.RESEND,
         sender_email="pending@example.com",
-        encrypted_credentials=ResendEmailProviderEncryptedCredentials(encrypted_api_key="opaque-email-key"),
-        tenant_id="00000000-0000-0000-0000-000000000999",
         sender_name="Pending",
+        encrypted_credentials=ChannelEncryptedCredentials(ciphertext="opaque-email-key"),
+        tenant_id="00000000-0000-0000-0000-000000000999",
     )
 
 
@@ -257,7 +240,7 @@ def test_update_uses_id_and_scalar_version_cas_and_is_rollback_safe(
         current,
         updated_at=_LATER,
         provider_tenant_id="provider-tenant-updated",
-        encrypted_credentials=IMEncryptedCredentials(ciphertext="opaque-rotated-ciphertext"),
+        encrypted_credentials=ChannelEncryptedCredentials(ciphertext="opaque-rotated-ciphertext"),
         app_identifier="app-updated",
         webhook_id=WebhookId("f" * 32),
         config_version=2,
@@ -376,7 +359,12 @@ def test_replace_rejects_invalid_replacement_before_mutation_sql(
     event.listen(channel_engine, "before_cursor_execute", capture)
     try:
         with Session(channel_engine) as session:
-            with pytest.raises(ValueError):
+            with pytest.raises(
+                ValueError,
+                match=(
+                    "replacement IM Channel must use a different ID|initial IM Channel configuration version must be 1"
+                ),
+            ):
                 _writer(session, "workspace").replace(current.id, 1, replacement)
     finally:
         event.remove(channel_engine, "before_cursor_execute", capture)

@@ -31,15 +31,24 @@ class IMDirectory(Protocol):
     """Adapter-bound directory capability."""
 
     def read_directory(self) -> Directory | DirectoryReadFailure:
-        """Return a complete snapshot or one failure without partial entries."""
+        """Return identities with downloaded avatars, or fail without partial entries.
+
+        Provider authentication and image retrieval finish before returning.
+        Missing avatars and HTTP 404 are None; other avatar errors fail the snapshot.
+        """
         ...
 
 
 class IMMessaging(Protocol):
     """Adapter-bound personal text messaging capability."""
 
-    def send_text(self, provider_user_id: ProviderUserId, body: str) -> MessageSendingResult:
-        """Attempt one provider message creation without automatic replay."""
+    def send_text(
+        self, provider_user_id: ProviderUserId, body: str, subject: str | None = None
+    ) -> MessageSendingResult:
+        """Send a CommonMark body with an optional plain-text subject, without replay.
+
+        Each adapter owns subject presentation and provider-specific formatting.
+        """
         ...
 
 
@@ -79,16 +88,19 @@ class IMCardEventDecoder(Protocol):
 class IMEventConsumer(Protocol):
     """Thread-safe consumer of authenticated provider events."""
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
         """Accept only after processing or taking responsibility for processing."""
         ...
 
 
 class IMWebhookHandler(Protocol):
-    """Thread-safe framework-neutral authenticated webhook handler."""
+    """Thread-safe framework-neutral provider webhook handler."""
 
     def handle(self, request: WebhookRequest) -> WebhookResponse:
-        """Authenticate, decode, consume, and map one provider request."""
+        """Handle provider URL verification or authenticate and consume an event.
+
+        URL verification returns the provider response without invoking the consumer.
+        """
         ...
 
 
@@ -115,7 +127,12 @@ class IMProviderAdapter(Protocol):
     @property
     def provider(self) -> IMProvider: ...
 
-    def test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure: ...
+    def test_credentials(self) -> CredentialTestSuccess | CredentialTestFailure:
+        """Authenticate submitted credentials without reusing previously acquired tokens.
+
+        Execution errors propagate, with timeouts classified separately.
+        """
+        ...
 
     @property
     def directory(self) -> IMDirectory: ...

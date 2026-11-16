@@ -10,11 +10,10 @@ from sqlalchemy.orm import sessionmaker
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters import AuthenticatedIMEvent, IMEventIngressKind
 from core.human_input_v2.im_message_inbox import IMInboxRecord, IMInboxRecordId
-from core.human_input_v2.shared import IntegrationId
 from dify_app import DifyApp
-from models.human_input_v2 import IMMessageInbox
-from repositories.human_input_v2.im_message_inbox.repository import SQLAlchemyIMMessageInboxRepository
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 from services.human_input_v2.im_message_inbox.processor import IMInboxProcessor
+from services.human_input_v2.im_message_inbox.storage import IMInboxStorage
 from tasks.im_message_inbox_tasks import (
     IMInboxRuntimeNotConfiguredError,
     IMInboxTaskRetryError,
@@ -63,13 +62,19 @@ def _event() -> AuthenticatedIMEvent:
     )
 
 
-def _task_queue(task: object) -> str | None:
-    queue = getattr(task, "queue", None)
-    return queue if isinstance(queue, str) else None
+def test_processing_task_uses_human_input_delivery_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    dispatches: list[dict[str, object]] = []
 
+    def capture_dispatch(*_args: object, **options: object) -> None:
+        dispatches.append(options)
 
-def test_processing_task_uses_human_input_delivery_queue() -> None:
-    assert _task_queue(process_im_message_inbox_record) == "human_input_delivery"
+    monkeypatch.setitem(process_im_message_inbox_record.app.conf, "task_always_eager", False)
+    monkeypatch.setattr(process_im_message_inbox_record.app, "send_task", capture_dispatch)
+
+    process_im_message_inbox_record.apply_async(args=("record-1",))
+
+    assert len(dispatches) == 1
+    assert dispatches[0]["queue"] == "human_input_delivery"
 
 
 def test_processing_task_fails_closed_when_runtime_is_not_configured() -> None:
@@ -115,10 +120,8 @@ def test_processing_task_retries_sanitized_processor_failure(
 
 
 def test_processing_task_loads_callback_and_records_processed_fact(sqlite_engine: Engine) -> None:
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
-    repository = SQLAlchemyIMMessageInboxRepository(sessionmaker(bind=sqlite_engine, expire_on_commit=False))
-    accepted = repository.insert_or_resolve(IntegrationId("integration-1"), _event(), now=_NOW)
+    repository = IMInboxStorage(sessionmaker(bind=sqlite_engine, expire_on_commit=False))
+    accepted = repository.insert_or_resolve(IMChannelId("channel-1"), _event(), now=_NOW)
     consumer = _Consumer()
     processor = IMInboxProcessor(repository=repository, consumer=consumer, clock=lambda: _NOW)
     app = DifyApp(__name__)

@@ -7,10 +7,10 @@ from typing import NewType, override
 
 AccountId = NewType("AccountId", str)
 ContactId = NewType("ContactId", str)
+RecipientId = NewType("RecipientId", str)
 PlatformEntryId = NewType("PlatformEntryId", str)
 TenantId = NewType("TenantId", str)
 EmailProviderId = NewType("EmailProviderId", str)
-IntegrationId = NewType("IntegrationId", str)
 IMIdentityId = NewType("IMIdentityId", str)
 IMBindingId = NewType("IMBindingId", str)
 IMReconciliationChangeId = NewType("IMReconciliationChangeId", str)

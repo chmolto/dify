@@ -19,10 +19,12 @@ from core.human_input_v2.im_integration import (
     SyncResultFact,
     SyncResultPage,
 )
-from core.human_input_v2.shared import AccountId, IMSyncRunId
+from core.human_input_v2.im_integration.sync_records import IMSyncInitiator
+from core.human_input_v2.shared import IMSyncResultId, IMSyncRunId
+from libs.uuid_utils import uuidv7
 from models.human_input_v2 import HumanInputIMChannel, HumanInputIMSyncResult, HumanInputIMSyncRun
 from repositories.human_input_v2.im_binding_repository import IMBindingRepository
-from repositories.human_input_v2.im_channel_repository import IMChannel
+from repositories.human_input_v2.im_channel_repository import IMChannel, IMChannelId
 from repositories.human_input_v2.im_identity_repository import IMIdentityRepository
 
 from .mappers import sync_result_from_record, sync_result_to_record, sync_run_from_record, sync_run_to_record
@@ -41,9 +43,14 @@ class SQLAlchemyIMControlPlaneRepository:
         self,
         *,
         sync_run_id: IMSyncRunId,
-        started_by_account_id: AccountId | None,
+        started_by: IMSyncInitiator,
         now: NaiveDatetime,
     ) -> ActiveRunDecision:
+        """Persist one initiating identity or return the unchanged active run.
+
+        The caller owns the transaction. The Channel lock serializes creation;
+        a stale revision returns without creating a run.
+        """
         revision = IMChannelRevision(
             str(self._channel.id),
             self._channel.config_version,
@@ -54,28 +61,96 @@ class SQLAlchemyIMControlPlaneRepository:
                 None,
                 StaleRevision(revision, None),
             )
-        active_record = self._session.scalar(
+        active_records = self._session.scalars(
             sa.select(HumanInputIMSyncRun)
             .where(
-                HumanInputIMSyncRun.integration_id == str(self._channel.id),
+                HumanInputIMSyncRun.channel_id == str(self._channel.id),
                 HumanInputIMSyncRun.status.in_((IMSyncRunStatus.QUEUED, IMSyncRunStatus.RUNNING)),
             )
             .order_by(HumanInputIMSyncRun.created_at, HumanInputIMSyncRun.id)
-            .limit(1)
-        )
-        if active_record is not None:
-            return ActiveRunDecision(ActiveRunDecisionKind.EXISTING_ACTIVE, sync_run_from_record(active_record))
+            # A locking read also observes the previous lock holder's commit on
+            # databases whose ordinary reads retain a transaction snapshot.
+            .with_for_update()
+        ).all()
+        current_active: HumanInputIMSyncRun | None = None
+        for active_record in active_records:
+            if active_record.channel_config_version < self._channel.config_version:
+                self._finish_stale_run(active_record, now)
+            else:
+                current_active = active_record
+        if current_active is not None:
+            return ActiveRunDecision(ActiveRunDecisionKind.EXISTING_ACTIVE, sync_run_from_record(current_active))
         run = IMSyncRun.create(
             sync_run_id=sync_run_id,
             channel_revision=revision,
             provider=self._channel.provider,
-            started_by_account_id=started_by_account_id,
+            started_by=started_by,
             now=now,
         )
         record = sync_run_to_record(run)
         self._session.add(record)
         self._session.flush([record])
         return ActiveRunDecision(ActiveRunDecisionKind.CREATED, sync_run_from_record(record))
+
+    def finish_stale_run(self, sync_run_id: IMSyncRunId, *, now: NaiveDatetime) -> IMSyncRun | None:
+        """Finish this Channel's older capture under Channel-then-run locks.
+
+        Return None when the Channel snapshot is no longer current or the run
+        does not belong to an older revision of it. The caller owns the transaction.
+        Terminal runs are returned without appending another diagnostic.
+        """
+        if not self._serialize_current_channel():
+            return None
+        record = self._session.scalar(
+            sa.select(HumanInputIMSyncRun)
+            .where(
+                HumanInputIMSyncRun.id == str(sync_run_id),
+                HumanInputIMSyncRun.channel_id == str(self._channel.id),
+                HumanInputIMSyncRun.channel_config_version < self._channel.config_version,
+            )
+            .with_for_update()
+        )
+        if record is None:
+            return None
+        if record.status in (IMSyncRunStatus.QUEUED, IMSyncRunStatus.RUNNING):
+            self._finish_stale_run(record, now)
+        return sync_run_from_record(record)
+
+    def _finish_stale_run(self, record: HumanInputIMSyncRun, now: NaiveDatetime) -> None:
+        """The caller holds both row locks; never modify current directory state."""
+        code = "stale_revision"
+        message = "IM Channel revision changed before reconciliation apply."
+        diagnostic = SyncResultFact(
+            id=IMSyncResultId(str(uuidv7())),
+            channel_id=IMChannelId(record.channel_id),
+            sync_run_id=IMSyncRunId(record.id),
+            operation_key=f"diagnostic:{code}",
+            result_type=IMSyncResultType.FAILED,
+            provider_user_id=None,
+            display_name=None,
+            email=None,
+            normalized_email=None,
+            contact_id=None,
+            identity_id=None,
+            binding_id=None,
+            removal_reason=None,
+            reason_code=code,
+            reason_message=message,
+            directory_entry_payload=None,
+            contact_snapshot=None,
+            identity_snapshot=None,
+            created_at=now,
+            updated_at=now,
+        )
+        self._session.add(sync_result_to_record(diagnostic))
+        record.status = IMSyncRunStatus.FAILED
+        record.failed_count = 1
+        record.started_at = record.started_at or now
+        record.finished_at = now
+        record.error_code = code
+        record.error_message = message
+        record.updated_at = now
+        self._session.flush()
 
     def _serialize_current_channel(self) -> bool:
         """Acquire the current Channel row's database write lock portably."""
@@ -87,7 +162,7 @@ class SQLAlchemyIMControlPlaneRepository:
                 HumanInputIMChannel.config_version == self._channel.config_version,
                 HumanInputIMChannel.provider == self._channel.provider,
             )
-            .values(updated_at=HumanInputIMChannel.updated_at)
+            .values({HumanInputIMChannel.updated_at: HumanInputIMChannel.updated_at})
             .execution_options(autoflush=False, synchronize_session=False)
         )
         if not isinstance(result, CursorResult):
@@ -101,7 +176,7 @@ class SQLAlchemyIMControlPlaneRepository:
     def load_latest_sync_run(self) -> IMSyncRun | None:
         record = self._session.scalar(
             sa.select(HumanInputIMSyncRun)
-            .where(HumanInputIMSyncRun.integration_id == str(self._channel.id))
+            .where(HumanInputIMSyncRun.channel_id == str(self._channel.id))
             .order_by(HumanInputIMSyncRun.created_at.desc(), HumanInputIMSyncRun.id.desc())
             .limit(1)
         )

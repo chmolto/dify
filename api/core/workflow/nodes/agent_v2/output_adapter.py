@@ -4,7 +4,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from clients.agent_backend import (
-    AgentBackendDeferredToolCallInternalEvent,
     AgentBackendInternalEvent,
     AgentBackendInternalEventType,
     AgentBackendRunCancelledInternalEvent,
@@ -24,6 +23,9 @@ from models.agent_config_entities import DeclaredOutputConfig, DeclaredOutputTyp
 
 class ToolFileRebacker(Protocol):
     def __call__(self, *, tenant_id: str, tool_file_id: str) -> File | None: ...
+
+
+STREAM_EXHAUSTED_ERROR = "Agent backend stream ended before a terminal event."
 
 
 class WorkflowAgentOutputAdapter:
@@ -53,13 +55,15 @@ class WorkflowAgentOutputAdapter:
         metadata: dict[str, Any],
         declared_outputs: Sequence[DeclaredOutputConfig] | None = None,
         tenant_id: str | None = None,
+        edge_source_handle: str = "source",
     ) -> NodeRunResult:
         """Build the successful node result from one backend terminal event.
 
         For structured runs, ``declared_outputs`` contains the custom-only
         declarations used to scope field and file normalization. Plain runs
         omit custom declarations, and a free-form string is mapped to the
-        system ``text`` output.
+        system ``text`` output. The caller validates and selects the successful
+        ``edge_source_handle`` before invoking this adapter.
 
         Canonical persisted-file mappings (``local_file`` / ``tool_file`` /
         ``datasource_file``) also require ``metadata["tenant_id"]`` so the
@@ -72,6 +76,7 @@ class WorkflowAgentOutputAdapter:
         resolved_tenant_id = tenant_id or (metadata_tenant_id if isinstance(metadata_tenant_id, str) else None)
         return NodeRunResult(
             status=WorkflowNodeExecutionStatus.SUCCEEDED,
+            edge_source_handle=edge_source_handle,
             inputs=inputs,
             process_data=process_data,
             outputs=self._normalize_outputs(
@@ -132,7 +137,7 @@ class WorkflowAgentOutputAdapter:
             process_data=process_data,
             metadata=self._build_node_metadata(metadata=metadata, usage=usage),
             llm_usage=usage or LLMUsage.empty_usage(),
-            error="Agent backend stream ended before a terminal event.",
+            error=STREAM_EXHAUSTED_ERROR,
             error_type="agent_backend_stream_error",
         )
 
@@ -335,7 +340,6 @@ class WorkflowAgentOutputAdapter:
         if isinstance(
             event,
             AgentBackendRunSucceededInternalEvent
-            | AgentBackendDeferredToolCallInternalEvent
             | AgentBackendRunFailedInternalEvent
             | AgentBackendRunCancelledInternalEvent,
         ):

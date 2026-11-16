@@ -11,11 +11,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import version
+from typing import Literal, override
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from lark_oapi.core.cache import LocalCache
+from lark_oapi.core.token import TokenManager
 
 from controllers.console.human_input_v2.providers import (
     FeishuCredentialsInput as FeishuCredentialRequest,
@@ -47,6 +50,7 @@ from core.human_input_v2.im_integration.adapters import (
 )
 from core.human_input_v2.im_integration.adapters import feishu_lark as adapter_module
 from core.human_input_v2.im_integration.adapters.credentials import FeishuCredentials, LarkCredentials
+from core.human_input_v2.im_integration.adapters.entities import IMProviderError
 from core.human_input_v2.im_integration.adapters.feishu_lark import (
     FeishuIMProviderAdapter,
     LarkIMProviderAdapter,
@@ -62,15 +66,19 @@ class _RequestRecord:
     method: str
     path: str
     body: dict[str, object] | None
+    authorization: str | None
 
 
 @dataclass(slots=True)
 class _ServerState:
     requests: list[_RequestRecord] = field(default_factory=list)
+    markdown_cards: list[dict[str, object]] = field(default_factory=list)
     paginated_scope: bool = False
     paginated_directory: bool = False
     live_readiness_directory: bool = False
     omitted_empty_directory: bool = False
+    issued_tokens: int = 0
+    token_error_code: int | None = None
 
 
 class _SDKHTTPServer(ThreadingHTTPServer):
@@ -86,7 +94,9 @@ def _provider_confirmed_card_content() -> dict[str, object]:
     )
 
 
-def _is_provider_confirmed_card_request(request_body: dict[str, object] | None) -> bool:
+def _is_provider_confirmed_card_request(
+    request_body: dict[str, object] | None, markdown_cards: list[dict[str, object]]
+) -> bool:
     if request_body is None or request_body.get("msg_type") != "interactive":
         return False
     content = request_body.get("content")
@@ -96,12 +106,10 @@ def _is_provider_confirmed_card_request(request_body: dict[str, object] | None) 
         decoded_content = json.loads(content)
     except json.JSONDecodeError:
         return False
-    return decoded_content == _provider_confirmed_card_content()
+    return decoded_content == _provider_confirmed_card_content() or decoded_content in markdown_cards
 
 
 class _SDKRequestHandler(BaseHTTPRequestHandler):
-    server: _SDKHTTPServer
-
     def do_GET(self) -> None:
         self._handle()
 
@@ -111,25 +119,35 @@ class _SDKRequestHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         self._handle()
 
+    @override
     def log_message(self, format: str, *args: object) -> None:
         del format, args
 
     def _handle(self) -> None:
+        assert isinstance(self.server, _SDKHTTPServer)
         body = self._body()
         self.server.state.requests.append(
             _RequestRecord(
                 method=self.command,
                 path=self.path,
                 body=body,
+                authorization=self.headers.get("Authorization"),
             )
         )
         route = self.path.split("?", maxsplit=1)[0]
         if route == "/open-apis/auth/v3/tenant_access_token/internal":
+            if self.server.state.token_error_code is not None:
+                self._respond({"code": self.server.state.token_error_code, "msg": "credential rejected"})
+                return
+            if body is None or body.get("app_secret") != "sanitized-app-secret":
+                self._respond({"code": 10014, "msg": "invalid app secret"})
+                return
+            self.server.state.issued_tokens += 1
             self._respond(
                 {
                     "code": 0,
                     "msg": "ok",
-                    "tenant_access_token": "t-sanitized-access-token",
+                    "tenant_access_token": f"t-sanitized-access-token-{self.server.state.issued_tokens}",
                     "expire": 7200,
                 }
             )
@@ -199,7 +217,9 @@ class _SDKRequestHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
-            items = [{"department_id": "dept_root"}] if self.server.state.paginated_directory else []
+            items: list[dict[str, str]] = (
+                [{"department_id": "dept_root"}] if self.server.state.paginated_directory else []
+            )
             self._respond({"code": 0, "msg": "ok", "data": {"items": items, "has_more": False}})
             return
         if route == "/open-apis/contact/v3/departments/dept_sanitized/children":
@@ -342,7 +362,7 @@ class _SDKRequestHandler(BaseHTTPRequestHandler):
             if (
                 body is not None
                 and body.get("msg_type") == "interactive"
-                and not _is_provider_confirmed_card_request(body)
+                and not _is_provider_confirmed_card_request(body, self.server.state.markdown_cards)
             ):
                 self._respond({"code": 230001, "msg": "sanitized card contract rejection"})
                 return
@@ -413,17 +433,22 @@ class _Consumer:
         self.acceptance = acceptance
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self.events.append(event)
         return self.acceptance
 
 
 class _FailingConsumer:
-    def accept(self, _event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del event, request_ip_address
         raise RuntimeError("sanitized consumer failure")
 
 
 class _ScriptedGateway:
+    def request_tenant_access_token(self) -> str:
+        return "sanitized-access-token"
+
     def __init__(self) -> None:
         self.tenant: list[Mapping[str, object] | Exception] = []
         self.scope: list[Mapping[str, object] | Exception] = []
@@ -440,27 +465,37 @@ class _ScriptedGateway:
             raise value
         return value
 
-    def query_tenant(self) -> Mapping[str, object]:
+    def query_tenant(self, *, request_option: object = None) -> Mapping[str, object]:
+        del request_option
         self.calls.append("tenant")
         return self._next(self.tenant)
 
-    def list_scope(self, _page_token: str | None) -> Mapping[str, object]:
+    def list_scope(self, page_token: str | None, *, request_option: object = None) -> Mapping[str, object]:
+        del request_option, page_token
         self.calls.append("scope")
         return self._next(self.scope)
 
-    def list_departments(self, _department_id: str, _page_token: str | None) -> Mapping[str, object]:
+    def list_departments(
+        self, department: adapter_module._DepartmentIdentity, page_token: str | None, *, request_option: object = None
+    ) -> Mapping[str, object]:
+        del request_option, department, page_token
         self.calls.append("departments")
         return self._next(self.departments)
 
-    def list_users(self, _department_id: str, _page_token: str | None) -> Mapping[str, object]:
+    def list_users(
+        self, department: adapter_module._DepartmentIdentity, page_token: str | None
+    ) -> Mapping[str, object]:
+        del department, page_token
         self.calls.append("users")
         return self._next(self.users)
 
-    def create_message(self, _receive_id: str, _msg_type: str, _content: str) -> Mapping[str, object]:
+    def create_message(self, receive_id: str, msg_type: str, content: str) -> Mapping[str, object]:
+        del receive_id, msg_type, content
         self.calls.append("create")
         return self._next(self.creates)
 
-    def patch_message(self, _message_id: str, _content: str) -> Mapping[str, object]:
+    def patch_message(self, message_id: str, content: str) -> Mapping[str, object]:
+        del message_id, content
         self.calls.append("patch")
         return self._next(self.patches)
 
@@ -548,19 +583,92 @@ def _signed_request(
 
 
 @pytest.fixture
-def sdk_server() -> Generator[_RunningServer, None, None]:
+def sdk_server(monkeypatch: pytest.MonkeyPatch) -> Generator[_RunningServer]:
+    monkeypatch.setattr(TokenManager, "cache", LocalCache())
     state = _ServerState()
     server = _SDKHTTPServer(("127.0.0.1", 0), _SDKRequestHandler)
     server.state = state
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     try:
-        host, port = server.server_address
+        host, port = server.server_address[:2]
         yield _RunningServer(f"http://{host}:{port}", state)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+@pytest.mark.parametrize("changed_secret", [False, True], ids=["revoked-credentials", "wrong-secret"])
+def test_credential_test_rejects_invalid_credentials_despite_a_cached_token(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_server: _RunningServer,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
+    changed_secret: bool,
+) -> None:
+    monkeypatch.setattr(
+        adapter_module,
+        "_create_sdk_gateway",
+        lambda credentials, _domain: _OfficialSDKGateway(credentials, sdk_server.domain),
+    )
+    credentials = _credentials()
+    _OfficialSDKGateway(credentials, sdk_server.domain).query_tenant()
+    if changed_secret:
+        credentials = credentials.model_copy(update={"app_secret": "invalid-secret"})
+    else:
+        sdk_server.state.token_error_code = 10014
+    adapter = (
+        FeishuIMProviderAdapter(credentials)
+        if provider is IMProvider.FEISHU
+        else LarkIMProviderAdapter(
+            LarkCredentials(provider=IMProvider.LARK, app_id=credentials.app_id, app_secret=credentials.app_secret)
+        )
+    )
+
+    result = adapter.test_credentials()
+
+    assert isinstance(result, CredentialTestFailure)
+    assert result.kind is CredentialTestFailureKind.AUTHENTICATION_REJECTED
+    assert result.provider_error_code == "10014"
+
+
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_repeated_credential_tests_use_fresh_tokens_without_replacing_the_runtime_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_server: _RunningServer,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
+) -> None:
+    monkeypatch.setattr(
+        adapter_module,
+        "_create_sdk_gateway",
+        lambda credentials, _domain: _OfficialSDKGateway(credentials, sdk_server.domain),
+    )
+    runtime_gateway = _OfficialSDKGateway(_credentials(), sdk_server.domain)
+    runtime_gateway.query_tenant()
+    adapter = (
+        FeishuIMProviderAdapter(_credentials())
+        if provider is IMProvider.FEISHU
+        else LarkIMProviderAdapter(
+            LarkCredentials(
+                provider=IMProvider.LARK,
+                app_id=_credentials().app_id,
+                app_secret=_credentials().app_secret,
+            )
+        )
+    )
+
+    for token_number in (2, 3):
+        request_start = len(sdk_server.state.requests)
+        assert adapter.test_credentials() == CredentialTestSuccess(provider, "tenant_sanitized")
+        test_requests = sdk_server.state.requests[request_start:]
+        assert test_requests[0].path == "/open-apis/auth/v3/tenant_access_token/internal"
+        assert {request.authorization for request in test_requests[1:]} == {
+            f"Bearer t-sanitized-access-token-{token_number}"
+        }
+
+    runtime_gateway.query_tenant()
+    assert sdk_server.state.requests[-1].authorization == "Bearer t-sanitized-access-token-1"
 
 
 def test_official_sdk_gateway_maps_tenant_directory_and_message_operations(sdk_server: _RunningServer) -> None:
@@ -685,7 +793,7 @@ def test_directory_starts_at_root_without_reading_scope(sdk_server: _RunningServ
 def test_live_readiness_minimal_shapes_preserve_official_sdk_department_identity(
     monkeypatch: pytest.MonkeyPatch,
     sdk_server: _RunningServer,
-    provider: IMProvider,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
 ) -> None:
     sdk_server.state.live_readiness_directory = True
     monkeypatch.setattr(
@@ -749,7 +857,7 @@ def test_live_readiness_minimal_shapes_preserve_official_sdk_department_identity
 def test_official_sdk_directory_accepts_omitted_items_on_empty_terminal_pages(
     monkeypatch: pytest.MonkeyPatch,
     sdk_server: _RunningServer,
-    provider: IMProvider,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
 ) -> None:
     sdk_server.state.omitted_empty_directory = True
     monkeypatch.setattr(
@@ -787,12 +895,15 @@ def test_official_sdk_directory_accepts_omitted_items_on_empty_terminal_pages(
 def test_full_adapter_over_official_http_sdk_preserves_wrapper_parity(
     monkeypatch: pytest.MonkeyPatch,
     sdk_server: _RunningServer,
-    provider: IMProvider,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
 ) -> None:
     sdk_server.state.paginated_directory = True
+    sdk_server.state.markdown_cards.append(
+        {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": "Decision: **Approve**"}]}}
+    )
     observed_domains: list[str] = []
 
-    def gateway_factory(credentials, domain: str):
+    def gateway_factory(credentials: FeishuCredentials | LarkCredentials, domain: str) -> _OfficialSDKGateway:
         observed_domains.append(domain)
         return _OfficialSDKGateway(credentials, sdk_server.domain)
 
@@ -863,8 +974,17 @@ def test_full_adapter_over_official_http_sdk_preserves_wrapper_parity(
     )
     assert len(message_requests) == 2
     assert len(patch_requests) == 1
-    assert json.loads(message_requests[0].body["content"]) == {"text": "Decision: Approve"}
-    assert message_requests[1].body["msg_type"] == "interactive"
+    first_body = message_requests[0].body
+    second_body = message_requests[1].body
+    assert first_body is not None
+    assert second_body is not None
+    assert isinstance(first_body["content"], str)
+    assert first_body["msg_type"] == "interactive"
+    assert json.loads(first_body["content"]) == {
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "markdown", "content": "Decision: **Approve**"}]},
+    }
+    assert second_body["msg_type"] == "interactive"
 
 
 def test_controller_projections_feed_typed_adapter_construction(
@@ -876,24 +996,28 @@ def test_controller_projections_feed_typed_adapter_construction(
         "_create_sdk_gateway",
         lambda credentials, _domain: _OfficialSDKGateway(credentials, sdk_server.domain),
     )
-    feishu_request = FeishuCredentialRequest(
-        provider=IMProvider.FEISHU,
-        app_id="cli_sanitized_app",
-        app_secret="sanitized-app-secret",
-        verification_token="sanitized-new-verification-token",
-        encrypt_key=None,
+    feishu_request = FeishuCredentialRequest.model_validate(
+        {
+            "provider": IMProvider.FEISHU,
+            "app_id": "cli_sanitized_app",
+            "app_secret": "sanitized-app-secret",
+            "verification_token": "sanitized-new-verification-token",
+            "encrypt_key": None,
+        }
     )
     feishu_resolved = feishu_request.to_owner_credentials()
     assert FeishuIMProviderAdapter(feishu_resolved).test_credentials() == CredentialTestSuccess(
         IMProvider.FEISHU,
         "tenant_sanitized",
     )
-    lark_request = LarkCredentialRequest(
-        provider=IMProvider.LARK,
-        app_id="cli_sanitized_app",
-        app_secret="sanitized-app-secret",
-        verification_token=None,
-        encrypt_key="sanitized-encrypt-key",
+    lark_request = LarkCredentialRequest.model_validate(
+        {
+            "provider": IMProvider.LARK,
+            "app_id": "cli_sanitized_app",
+            "app_secret": "sanitized-app-secret",
+            "verification_token": None,
+            "encrypt_key": "sanitized-encrypt-key",
+        }
     )
     lark_resolved = lark_request.to_owner_credentials()
     assert LarkIMProviderAdapter(lark_resolved).provider is IMProvider.LARK
@@ -968,7 +1092,7 @@ def test_socket_dispatcher_wire_ack_and_outer_lifecycle_are_integrated(
     class SDKClient:
         def __init__(
             self,
-            callback: Callable[[Mapping[str, object], Callable[[], None]], None],
+            callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
         ) -> None:
             self.channel = _SynchronousEventChannel(
                 credentials=credentials,
@@ -1001,7 +1125,11 @@ def test_socket_dispatcher_wire_ack_and_outer_lifecycle_are_integrated(
 
     clients: list[SDKClient] = []
 
-    def client_factory(_credentials, _domain, callback):
+    def client_factory(
+        _credentials: FeishuCredentials | LarkCredentials,
+        _domain: str,
+        callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> SDKClient:
         client = SDKClient(callback)
         clients.append(client)
         return client
@@ -1042,6 +1170,17 @@ def test_credential_failures_remain_typed_across_adapter_composition(
         gateway.scope.append(scope_result)
     adapter = _scripted_adapter(monkeypatch, gateway)
 
+    if isinstance(tenant_result, Exception) or isinstance(scope_result, Exception):
+        execution_error = tenant_result if isinstance(tenant_result, Exception) else scope_result
+        assert isinstance(execution_error, Exception)
+        with pytest.raises(type(execution_error)) as captured:
+            adapter.test_credentials()
+        assert captured.value is execution_error
+        return
+    if expected_kind is CredentialTestFailureKind.TENANT_ID_UNAVAILABLE:
+        with pytest.raises(IMProviderError):
+            adapter.test_credentials()
+        return
     result = adapter.test_credentials()
 
     assert isinstance(result, CredentialTestFailure)
@@ -1175,7 +1314,9 @@ def test_webhook_failure_ack_matrix_covers_auth_tenant_and_consumer_boundaries()
         encrypt_key=None,
     )
 
-    def handler(gateway: _ScriptedGateway, consumer: _Consumer | _FailingConsumer | None = None):
+    def handler(
+        gateway: _ScriptedGateway, consumer: _Consumer | _FailingConsumer | None = None
+    ) -> adapter_module._FeishuLarkWebhookHandler:
         return adapter_module._FeishuLarkWebhookHandler(
             gateway,
             plaintext_credentials,
@@ -1205,7 +1346,9 @@ def test_webhook_failure_ack_matrix_covers_auth_tenant_and_consumer_boundaries()
     assert handler(_ScriptedGateway()).handle(WebhookRequest("POST", (), b"{}", datetime.now())).status_code == 400
 
     wrong_token_body = _event_payload()
-    wrong_token_body["header"]["token"] = "wrong"
+    header = wrong_token_body["header"]
+    assert isinstance(header, dict)
+    header["token"] = "wrong"
     assert (
         handler(_ScriptedGateway())
         .handle(
@@ -1239,7 +1382,7 @@ def test_webhook_failure_ack_matrix_covers_auth_tenant_and_consumer_boundaries()
 def test_official_stream_client_and_channel_hooks_close_owned_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    channels: list[object] = []
+    channels: list[ReadyChannel] = []
 
     class ReadyChannel:
         def __init__(self, **_kwargs: object) -> None:
@@ -1370,7 +1513,7 @@ def test_per_client_sdk_close_failure_releases_its_actual_owned_loop(
     client = adapter_module._PerClientSDKWSClient(
         credentials=_secure_credentials(),
         domain="https://open.feishu.cn",
-        event_handler=object(),
+        event_handler=adapter_module.lark.EventDispatcherHandler.builder("", "").build(),
     )
     start_errors: list[Exception] = []
 
@@ -1418,7 +1561,7 @@ def test_official_stream_clients_own_independent_sdk_event_loops(
 
     transport_loops: dict[str, asyncio.AbstractEventLoop] = {}
 
-    def connection_url(ws_client: object) -> str:
+    def connection_url(ws_client: sdk_ws_client_module.Client) -> str:
         app_id = ws_client._app_id
         return f"wss://sanitized.invalid/{app_id}?device_id=device-sanitized&service_id=1"
 
@@ -1510,7 +1653,7 @@ def test_official_stream_stop_during_start_prevents_late_transport_creation(
 
     original_base_stop = adapter_module.FeishuChannel.stop
 
-    def observed_base_stop(channel: object, *, join_timeout: float = 5.0) -> None:
+    def observed_base_stop(channel: adapter_module.FeishuChannel, *, join_timeout: float = 5.0) -> None:
         original_base_stop(channel, join_timeout=join_timeout)
         base_stop_completed.set()
 
@@ -1573,7 +1716,7 @@ def test_synchronous_channel_installs_write_hook_during_public_ready_boundary(
         domain="https://open.feishu.cn",
         callback=lambda _event, acknowledge: acknowledge(),
     )
-    channel._fetch_bot_identity_sync = lambda: None
+    monkeypatch.setattr(channel, "_fetch_bot_identity_sync", lambda: None)
 
     original_install = channel._install_wire_ack_hook
 
@@ -1582,7 +1725,7 @@ def test_synchronous_channel_installs_write_hook_during_public_ready_boundary(
         assert isinstance(ws_client, ReadyClient)
         ws_client.hook_installed.set()
 
-    channel._install_wire_ack_hook = install_and_release
+    monkeypatch.setattr(channel, "_install_wire_ack_hook", install_and_release)
 
     asyncio.run(channel.connect_until_ready(timeout=1))
     writer = channel._ws_client
@@ -1638,7 +1781,7 @@ def test_directory_rejects_incomplete_or_ambiguous_provider_pages(failure_case: 
     ],
 )
 def test_directory_rejects_malformed_non_empty_sdk_pages_without_partial_result(
-    provider: IMProvider,
+    provider: Literal[IMProvider.FEISHU, IMProvider.LARK],
     malformed_boundary: str,
 ) -> None:
     gateway = _ScriptedGateway()
@@ -1711,7 +1854,7 @@ def test_directory_deduplicates_users_and_department_cycles_from_root() -> None:
     assert gateway.calls == ["users", "departments"]
 
 
-def test_commonmark_conversion_preserves_semantics_over_official_message_boundary(
+def test_subject_and_body_markdown_survive_the_official_message_boundary(
     monkeypatch: pytest.MonkeyPatch,
     sdk_server: _RunningServer,
 ) -> None:
@@ -1722,11 +1865,21 @@ def test_commonmark_conversion_preserves_semantics_over_official_message_boundar
     )
     adapter = FeishuIMProviderAdapter(_credentials())
 
-    result = adapter.messaging.send_text(
-        ProviderUserId("union_sanitized_user"),
+    body = (
         "# Decision\n\n- **Approve**\n- [Review](https://example.invalid)\n\n"
-        "![Diagram](https://image.invalid)\n\n`inline`  \nnext\n\n```text\ncode\n```",
+        "![Diagram](https://image.invalid)\n\n`inline`  \nnext\n\n```text\ncode\n```"
     )
+    expected_card: dict[str, object] = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": r"# \#\#\# Review \*\*Alice\*\*"},
+                {"tag": "markdown", "content": body},
+            ]
+        },
+    }
+    sdk_server.state.markdown_cards.append(expected_card)
+    result = adapter.messaging.send_text(ProviderUserId("union_sanitized_user"), body, subject="### Review **Alice**")
 
     assert isinstance(result, MessageAccepted)
     message_request = next(
@@ -1734,9 +1887,11 @@ def test_commonmark_conversion_preserves_semantics_over_official_message_boundar
         for request in sdk_server.state.requests
         if request.method == "POST" and "/open-apis/im/v1/messages?" in request.path
     )
-    assert json.loads(message_request.body["content"]) == {
-        "text": "Decision\nApprove\nReview (https://example.invalid)\nDiagram\ninline\nnext\ncode"
-    }
+    request_body = message_request.body
+    assert request_body is not None
+    assert isinstance(request_body["content"], str)
+    assert request_body["msg_type"] == "interactive"
+    assert json.loads(request_body["content"]) == expected_card
 
 
 def test_secure_webhook_rejects_auth_crypto_boundaries() -> None:
@@ -1781,7 +1936,7 @@ def test_stream_failure_stop_and_late_callback_boundaries_are_one_shot(
     class LifecycleClient:
         def __init__(
             self,
-            callback: Callable[[Mapping[str, object], Callable[[], None]], None],
+            callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
             *,
             fail_start: bool,
             fail_stop: bool,
@@ -1810,7 +1965,11 @@ def test_stream_failure_stop_and_late_callback_boundaries_are_one_shot(
             self.callback(_sdk_transport_envelope(event), acknowledge)
             return acknowledgements
 
-    def client_factory(_credentials, _domain, callback):
+    def client_factory(
+        _credentials: FeishuCredentials | LarkCredentials,
+        _domain: str,
+        callback: Callable[[adapter_module._SDKEventEnvelope, Callable[[], None]], None],
+    ) -> LifecycleClient:
         client = LifecycleClient(
             callback,
             fail_start=not clients,

@@ -1,68 +1,61 @@
-import type {
-  ContactImAuthMode,
-  ContactImProvider,
-  ContactImProviderDefinition,
-  ContactImProviderField,
-} from './types'
-import {
-  ContactImAuthMode as AuthMode,
-  ContactImProvider as Provider,
-  ContactImProviderField as ProviderField,
-} from './types'
+import type { ContactImProviderDefinition } from './types'
+import type { DocPathWithoutLang } from '@/types/doc-paths'
+import { ContactImProvider, ContactImProviderField } from './types'
 
-type NonSecretProviderField = Exclude<ContactImProviderField, 'secret'>
-
-export type ContactImCredentialFormAdapter = {
-  authMode: Extract<ContactImAuthMode, 'credentials'>
-  fields: NonSecretProviderField[]
-  provider: Extract<ContactImProvider, 'dingtalk' | 'slack'>
-  requiresSecret: true
+const setupGuidePaths: Record<Exclude<ContactImProvider, 'resend'>, DocPathWithoutLang> = {
+  slack: '/use-dify/workspace/channels/slack',
+  feishu: '/use-dify/workspace/channels/feishu-lark',
+  lark: '/use-dify/workspace/channels/feishu-lark',
+  ding_talk: '/use-dify/workspace/channels/dingtalk',
+  ms_teams: '/use-dify/workspace/channels/ms-teams',
+  we_com: '/use-dify/workspace/channels/wecom',
 }
 
-export type ContactImOAuthFormAdapter = {
-  authMode: Extract<ContactImAuthMode, 'oauth'>
-  fields: []
-  provider: Extract<ContactImProvider, 'feishu'>
-  requiresSecret: false
+type ContactImCallbackSetup = {
+  consoleUrl: string
+  instructionsKey: 'feishu' | 'lark' | 'slack' | 'teams'
 }
 
-export type ContactImProviderFormAdapter =
-  | ContactImCredentialFormAdapter
-  | ContactImOAuthFormAdapter
-
-const getProviderFormAdapter = (provider: ContactImProvider): ContactImProviderFormAdapter => {
+export const resolveContactImCallbackSetup = (
+  provider: Exclude<ContactImProvider, 'resend'>,
+): ContactImCallbackSetup | null => {
   switch (provider) {
-    case Provider.Slack:
+    case ContactImProvider.Feishu:
+    case ContactImProvider.Lark: {
+      const origin =
+        provider === ContactImProvider.Feishu
+          ? 'https://open.feishu.cn'
+          : 'https://open.larksuite.com'
       return {
-        authMode: AuthMode.Credentials,
-        fields: [ProviderField.AppId],
-        provider,
-        requiresSecret: true,
+        consoleUrl: `${origin}/app`,
+        instructionsKey: provider,
       }
-    case Provider.Feishu:
+    }
+    case ContactImProvider.Slack:
       return {
-        authMode: AuthMode.OAuth,
-        fields: [],
-        provider,
-        requiresSecret: false,
+        consoleUrl: 'https://api.slack.com/apps',
+        instructionsKey: 'slack',
       }
-    case Provider.DingTalk:
+    case ContactImProvider.MSTeams:
       return {
-        authMode: AuthMode.Credentials,
-        fields: [ProviderField.ClientId],
-        provider,
-        requiresSecret: true,
+        consoleUrl: 'https://portal.azure.com/#browse/Microsoft.BotService%2FbotServices',
+        instructionsKey: 'teams',
       }
-    case Provider.Email:
-      throw new Error('Email uses its dedicated configuration form')
+    case ContactImProvider.DingTalk:
+    case ContactImProvider.WeCom:
+      return null
   }
 }
 
 export const resolveContactImProviderFormAdapter = (definition: ContactImProviderDefinition) => {
-  const adapter = getProviderFormAdapter(definition.provider)
+  if (definition.provider === ContactImProvider.Email)
+    throw new Error('Email uses its dedicated configuration form')
 
-  if (adapter.authMode !== definition.authMode)
-    throw new Error(`Provider form adapter mismatch for ${definition.provider}`)
-
-  return adapter
+  return {
+    setupGuidePath: setupGuidePaths[definition.provider],
+    fields: definition.requiredFields.map((field) => ({
+      ...field,
+      secret: field.secret || field.field === ContactImProviderField.Secret,
+    })),
+  }
 }

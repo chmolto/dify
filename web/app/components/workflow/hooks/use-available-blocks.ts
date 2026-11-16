@@ -11,9 +11,7 @@ const availableBlocksFilter = (nodeType: BlockEnum, inContainer?: boolean) => {
       nodeType === BlockEnum.Loop ||
       nodeType === BlockEnum.End ||
       nodeType === BlockEnum.DataSource ||
-      nodeType === BlockEnum.KnowledgeBase ||
-      nodeType === BlockEnum.HumanInput ||
-      nodeType === BlockEnum.HumanInputV2)
+      nodeType === BlockEnum.KnowledgeBase)
   )
     return false
 
@@ -62,7 +60,10 @@ export const useAvailableBlocks = (nodeType?: BlockEnum, inContainer?: boolean) 
         !nodeType ||
         nodeType === BlockEnum.Start ||
         nodeType === BlockEnum.StartPlaceholder ||
-        nodeType === BlockEnum.DataSource
+        nodeType === BlockEnum.DataSource ||
+        nodeType === BlockEnum.TriggerPlugin ||
+        nodeType === BlockEnum.TriggerWebhook ||
+        nodeType === BlockEnum.TriggerSchedule
       )
         availablePrevBlocks = []
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 # These tests exercise local SDK boundaries with test doubles, not Microsoft systems.
-import base64
 import json
 import threading
 from collections import deque
@@ -11,12 +10,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
 from typing import override
 
 import httpx
 import jwt
 import pytest
+from azure.core.credentials import AccessToken
 from botframework.connector import ConnectorClient
 from botframework.connector.auth import (
     ChannelValidation,
@@ -27,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 from msrest.authentication import BasicTokenAuthentication
 
+from core.file import remote_fetcher
 from core.human_input import ButtonStyle
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters import (
@@ -180,11 +180,11 @@ class _ConnectorServer:
 
 
 @pytest.fixture
-def connector_server() -> Generator[_ConnectorServer, None, None]:
+def connector_server() -> Generator[_ConnectorServer]:
     state = _ConnectorState()
     server = _ConnectorHTTPServer(("127.0.0.1", 0), _ConnectorHandler)
     server.state = state
-    thread = threading.Thread(target=server.serve_forever)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     try:
         yield _ConnectorServer(server, state)
@@ -201,11 +201,11 @@ class _GraphCredential:
         self.error = error
         self.close_count = 0
 
-    def get_token(self, scope: str) -> SimpleNamespace:
+    def get_token(self, scope: str) -> AccessToken:
         assert scope == "https://graph.microsoft.com/.default"
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(token=self.token)
+        return AccessToken(expires_on=2000000000, token=self.token)
 
     def close(self) -> None:
         self.close_count += 1
@@ -224,40 +224,12 @@ class _GraphBoundary:
         return response
 
 
-def _unsigned_token(claims: Mapping[str, object]) -> str:
-    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
-    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
-    return f"{header}.{payload}."
-
-
 def _credentials() -> MSTeamsCredentials:
     return MSTeamsCredentials(
         provider=IMProvider.MS_TEAMS,
         tenant_id="11111111-1111-1111-1111-111111111111",
         client_id="22222222-2222-2222-2222-222222222222",
         client_secret="test-only-client-secret",
-    )
-
-
-def _graph_token(*, tenant_id: str | None = None, roles: list[str] | None = None) -> str:
-    claims: dict[str, object] = {
-        "aud": "https://graph.microsoft.com",
-        "roles": ["User.Read.All"] if roles is None else roles,
-    }
-    if tenant_id is not None:
-        claims["tid"] = tenant_id
-    else:
-        claims["tid"] = _credentials().tenant_id
-    return _unsigned_token(claims)
-
-
-def _bot_token(*, tenant_id: str | None = None, client_id: str | None = None) -> str:
-    return _unsigned_token(
-        {
-            "aud": "https://api.botframework.com",
-            "appid": client_id or _credentials().client_id,
-            "tid": tenant_id or _credentials().tenant_id,
-        }
     )
 
 
@@ -284,10 +256,12 @@ def _adapter(
     credentials: MSTeamsCredentials | None = None,
 ) -> tuple[ms_teams.MSTeamsIMProviderAdapter, _GraphCredential, _GraphBoundary]:
     selected_credentials = credentials or _credentials()
-    graph_credential = _GraphCredential(graph_token or _graph_token(), graph_error)
-    graph_boundary = _GraphBoundary(graph_responses or [])
+    graph_credential = _GraphCredential(graph_token or "opaque-graph-access-token", graph_error)
+    graph_boundary = _GraphBoundary(
+        graph_responses if graph_responses is not None else [httpx.Response(200, json={"value": []})]
+    )
     graph_client = httpx.Client(transport=httpx.MockTransport(graph_boundary), timeout=2)
-    bot_credentials = MicrosoftAppCredentials(
+    bot_credentials = ms_teams._MSTeamsBotCredentials(
         selected_credentials.client_id,
         selected_credentials.client_secret,
         channel_auth_tenant=selected_credentials.tenant_id,
@@ -297,10 +271,7 @@ def _adapter(
         del force_refresh
         if bot_error is not None:
             raise bot_error
-        return bot_token or _bot_token(
-            tenant_id=selected_credentials.tenant_id,
-            client_id=selected_credentials.client_id,
-        )
+        return bot_token or "opaque-bot-access-token"
 
     def graph_credential_factory(*_args: object, **_kwargs: object) -> _GraphCredential:
         return graph_credential
@@ -401,7 +372,8 @@ class _RecordingConsumer:
         self._lock = threading.Lock()
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         with self._lock:
             self.events.append(event)
         return self.acceptance
@@ -422,6 +394,7 @@ def test_real_connector_and_graph_boundaries_round_trip_all_outbound_capabilitie
     monkeypatch: pytest.MonkeyPatch,
     connector_server: _ConnectorServer,
 ) -> None:
+    monkeypatch.setattr(remote_fetcher, "make_request", lambda *_args, **_kwargs: httpx.Response(404))
     state = connector_server.state
     for conversation_id in ("test-only-text-conversation", "test-only-card-conversation"):
         state.enqueue(
@@ -436,6 +409,7 @@ def test_real_connector_and_graph_boundaries_round_trip_all_outbound_capabilitie
     adapter, _, graph_boundary = _adapter(
         monkeypatch,
         graph_responses=[
+            httpx.Response(200, json={"value": []}),
             httpx.Response(
                 200,
                 json={
@@ -483,9 +457,10 @@ def test_real_connector_and_graph_boundaries_round_trip_all_outbound_capabilitie
     assert directory_result.entries[2].email is None
     assert isinstance(text_result, MessageAccepted)
     assert replacement_result is None
-    assert len(graph_boundary.requests) == 2
-    assert graph_boundary.requests[0].url.params["$select"] == "id,displayName,mail"
-    assert graph_boundary.requests[1].url == next_link
+    assert len(graph_boundary.requests) == 3
+    assert graph_boundary.requests[0].url.params["$top"] == "1"
+    assert graph_boundary.requests[1].url.params["$select"] == "id,displayName,mail"
+    assert graph_boundary.requests[2].url == next_link
 
     create_requests = state.requests_for("create")
     assert len(create_requests) == 2
@@ -501,6 +476,7 @@ def test_real_connector_and_graph_boundaries_round_trip_all_outbound_capabilitie
     text_body = send_requests[0].json_body()
     assert text_body["type"] == "message"
     assert text_body["text"] == "Sanitized **text**"
+    assert text_body["textFormat"] == "extendedmarkdown"
     card_body = send_requests[1].json_body()
     assert card_body["type"] == "message"
     assert card_body["summary"] == "Sanitized title"
@@ -553,6 +529,37 @@ def test_real_connector_and_graph_boundaries_round_trip_all_outbound_capabilitie
     assert update_requests[0].json_body() == {
         "type": "message",
         "text": "Sanitized **recorded** presentation",
+    }
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected_text"),
+    [
+        (None, "## Body\n\n**Approved**"),
+        ("", "## Body\n\n**Approved**"),
+        ("### Review **Alice**", "# \\#\\#\\# Review \\*\\*Alice\\*\\*\n\n## Body\n\n**Approved**"),
+    ],
+)
+def test_real_connector_sends_h1_subject_and_body_with_extended_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+    connector_server: _ConnectorServer,
+    subject: str | None,
+    expected_text: str,
+) -> None:
+    state = connector_server.state
+    state.enqueue("create", 201, {"id": "test-only-conversation", "serviceUrl": _PUBLIC_SERVICE_URL})
+    state.enqueue("send", 201, {"id": "test-only-activity"})
+    adapter, _, _ = _adapter(monkeypatch, connector_factory=_connector_factory(connector_server))
+
+    result = adapter.messaging.send_text(ProviderUserId("test-only-user"), "## Body\n\n**Approved**", subject)
+
+    assert isinstance(result, MessageAccepted)
+    requests = state.requests_for("send")
+    assert len(requests) == 1
+    assert requests[0].json_body() == {
+        "type": "message",
+        "textFormat": "extendedmarkdown",
+        "text": expected_text,
     }
 
 
@@ -679,6 +686,7 @@ def test_graph_boundary_never_publishes_partial_directory(
     responses: list[httpx.Response | Exception],
     expected_request_count: int,
 ) -> None:
+    monkeypatch.setattr(remote_fetcher, "make_request", lambda *_args, **_kwargs: httpx.Response(404))
     adapter, _, graph_boundary = _adapter(monkeypatch, graph_responses=responses)
 
     result = adapter.directory.read_directory()
@@ -732,66 +740,83 @@ def test_complete_card_assessment_rejects_unrepresentable_intent_without_sdk_io(
 
 
 @pytest.mark.parametrize(
-    ("graph_token", "graph_error", "bot_token", "bot_error", "expected_kind"),
+    ("graph_response", "graph_error", "bot_error", "expected_kind", "expected_code", "expected_status"),
     [
-        ("invalid", None, None, None, CredentialTestFailureKind.UNKNOWN),
         (
-            _unsigned_token(
-                {
-                    "aud": "https://graph.microsoft.com",
-                    "roles": ["User.Read.All"],
-                }
-            ),
-            None,
-            None,
-            None,
-            CredentialTestFailureKind.TENANT_ID_UNAVAILABLE,
-        ),
-        (
-            _graph_token(tenant_id="33333333-3333-3333-3333-333333333333"),
-            None,
+            httpx.Response(401, json={"error": {"code": "InvalidAuthenticationToken"}}),
             None,
             None,
             CredentialTestFailureKind.AUTHENTICATION_REJECTED,
+            "InvalidAuthenticationToken",
+            401,
         ),
-        (_graph_token(roles=[]), None, None, None, CredentialTestFailureKind.UNKNOWN),
         (
-            _graph_token(),
+            httpx.Response(403, json={"error": {"code": "Authorization_RequestDenied"}}),
+            None,
+            None,
+            CredentialTestFailureKind.PERMISSION_DENIED,
+            "Authorization_RequestDenied",
+            403,
+        ),
+        (
+            httpx.Response(403, json={"error": {}}),
+            None,
+            None,
+            CredentialTestFailureKind.PERMISSION_DENIED,
+            None,
+            403,
+        ),
+        (
+            httpx.Response(429, json={"error": {"code": "TooManyRequests"}}),
+            None,
+            None,
+            CredentialTestFailureKind.UNKNOWN,
+            "TooManyRequests",
+            429,
+        ),
+        (
+            httpx.Response(200, json={"value": []}),
             RuntimeError("test-only Graph outage"),
             None,
             None,
-            CredentialTestFailureKind.UNKNOWN,
-        ),
-        (_graph_token(), None, "invalid", None, CredentialTestFailureKind.UNKNOWN),
-        (
-            _graph_token(),
             None,
+            None,
+        ),
+        (
+            httpx.Response(200, json={"value": []}),
             None,
             RuntimeError("test-only Bot outage"),
-            CredentialTestFailureKind.UNKNOWN,
+            None,
+            None,
+            None,
         ),
         (
-            _graph_token(),
+            httpx.Response(200, json={"value": []}),
             None,
-            None,
-            PermissionError("invalid_client: test-only rejection"),
+            PermissionError(
+                "Failed to get access token with error: invalid_client, error_description: test-only rejection"
+            ),
             CredentialTestFailureKind.AUTHENTICATION_REJECTED,
+            "invalid_client",
+            None,
         ),
         (
-            _graph_token(),
+            httpx.Response(200, json={"value": []}),
             None,
-            None,
-            PermissionError("temporarily_unavailable: test-only outage"),
+            PermissionError(
+                "Failed to get access token with error: temporarily_unavailable, error_description: test-only outage"
+            ),
             CredentialTestFailureKind.UNKNOWN,
+            "temporarily_unavailable",
+            None,
         ),
     ],
     ids=(
-        "malformed-token",
-        "missing-tenant",
-        "tenant-mismatch",
-        "missing-permission",
+        "graph-token-rejected",
+        "graph-permission-denied",
+        "graph-no-api-code",
+        "graph-throttled",
         "graph-outage",
-        "malformed-bot-token",
         "bot-outage",
         "bot-rejection",
         "bot-transient",
@@ -799,24 +824,36 @@ def test_complete_card_assessment_rejects_unrepresentable_intent_without_sdk_io(
 )
 def test_public_credential_boundaries_return_capability_scoped_failures(
     monkeypatch: pytest.MonkeyPatch,
-    graph_token: str,
+    graph_response: httpx.Response,
     graph_error: Exception | None,
-    bot_token: str | None,
     bot_error: Exception | None,
-    expected_kind: CredentialTestFailureKind,
+    expected_kind: CredentialTestFailureKind | None,
+    expected_code: str | None,
+    expected_status: int | None,
 ) -> None:
     adapter, _, _ = _adapter(
         monkeypatch,
-        graph_token=graph_token,
+        graph_responses=[graph_response],
+        graph_token="opaque-graph-access-token",
         graph_error=graph_error,
-        bot_token=bot_token,
+        bot_token="opaque-bot-access-token",
         bot_error=bot_error,
     )
+    if expected_kind is None:
+        execution_error = graph_error if graph_error is not None else bot_error
+        assert isinstance(execution_error, Exception)
+        with pytest.raises(type(execution_error)) as captured:
+            adapter.test_credentials()
+        assert captured.value is execution_error
+        return
 
     result = adapter.test_credentials()
 
     assert isinstance(result, CredentialTestFailure)
     assert result.kind is expected_kind
+    assert result.provider_error_code == expected_code
+    assert result.http_status == expected_status
+    assert result.missing_permissions == ()
     assert "test-only" not in result.reason
 
 
@@ -915,7 +952,8 @@ def test_official_jwt_boundary_authenticates_complete_payload_ack_and_concurrenc
     no_timestamp_response = accepted_handler.handle(_webhook_request(body_without_timestamp, token))
 
     class FailingConsumer:
-        def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+        def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+            del request_ip_address
             del event
             raise RuntimeError("test-only consumer failure")
 

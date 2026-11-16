@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import ClassVar
 
 import pytest
 import sqlalchemy as sa
@@ -26,15 +27,15 @@ from core.human_input_v2.im_integration.adapters import (
 from core.human_input_v2.im_integration.adapters import slack as slack_adapter_module
 from core.human_input_v2.im_integration.adapters.slack import SlackIMProviderAdapter
 from core.human_input_v2.im_message_inbox import IMInboxRecordId
-from core.human_input_v2.shared import IntegrationId
-from models.human_input_v2 import IMMessageInbox
-from repositories.human_input_v2.im_message_inbox.repository import SQLAlchemyIMMessageInboxRepository
+from models.human_input_v2 import IMMessageEvent
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 from services.human_input_v2.im_message_inbox.sink import IMMessageInboxSink
+from services.human_input_v2.im_message_inbox.storage import IMInboxStorage
 from services.human_input_v2.im_message_inbox.telemetry import NoopIMInboxMetrics
 
 _SIGNING_SECRET = "sanitized-signing-material"
 _PROVIDER_TENANT_ID = "sanitized-team"
-_INTEGRATION_ID = IntegrationId("00000000-0000-0000-0000-000000000001")
+_CHANNEL_ID = IMChannelId("00000000-0000-0000-0000-000000000001")
 _RECEIVED_AT = datetime(2026, 8, 6, 8)
 _NOW = _RECEIVED_AT.replace(tzinfo=UTC)
 
@@ -79,9 +80,9 @@ class _DelegatingConsumer:
         self._sink = sink
         self.events = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
         self.events.append(event)
-        return self._sink.accept(event)
+        return self._sink.accept(event, request_ip_address=request_ip_address)
 
 
 def _credentials() -> SlackCredentials:
@@ -127,14 +128,12 @@ def _signed_request(body: bytes, *, valid_signature: bool = True) -> WebhookRequ
 
 
 def _build_sink(sqlite_engine: Engine) -> tuple[IMMessageInboxSink, sessionmaker[Session]]:
-    inbox_table = IMMessageInbox.metadata.tables[IMMessageInbox.__tablename__]
-    IMMessageInbox.metadata.create_all(sqlite_engine, tables=[inbox_table])
     session_maker = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
     sink = IMMessageInboxSink(
-        integration_id=_INTEGRATION_ID,
+        channel_id=_CHANNEL_ID,
         expected_provider=IMProvider.SLACK,
         expected_provider_tenant_id=_PROVIDER_TENANT_ID,
-        repository=SQLAlchemyIMMessageInboxRepository(session_maker),
+        repository=IMInboxStorage(session_maker),
         clock=_FixedClock().now,
         metrics=NoopIMInboxMetrics(),
     )
@@ -149,7 +148,7 @@ def test_slack_webhook_commits_only_authenticated_business_events_before_success
 
     def observe_commit(record_id: IMInboxRecordId) -> None:
         with session_maker() as session:
-            assert session.get(IMMessageInbox, str(record_id)) is not None
+            assert session.get(IMMessageEvent, str(record_id)) is not None
 
     task_publisher.observer = observe_commit
     consumer = _DelegatingConsumer(sink)
@@ -164,7 +163,7 @@ def test_slack_webhook_commits_only_authenticated_business_events_before_success
     challenge_response = handler.handle(_signed_request(challenge_body))
     assert consumer.events == []
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
 
     accepted_response = handler.handle(_signed_request(event_body))
 
@@ -175,11 +174,11 @@ def test_slack_webhook_commits_only_authenticated_business_events_before_success
     assert len(consumer.events) == 1
     assert len(task_publisher.record_ids) == 1
     with session_maker() as session:
-        stored = session.get_one(IMMessageInbox, str(task_publisher.record_ids[0]))
-        assert stored.integration_id == str(_INTEGRATION_ID)
+        stored = session.get_one(IMMessageEvent, str(task_publisher.record_ids[0]))
+        assert stored.channel_id == str(_CHANNEL_ID)
         assert stored.provider is IMProvider.SLACK
-        assert stored.provider_tenant_id == _PROVIDER_TENANT_ID
-        assert stored.provider_event_id == "sanitized-webhook-event"
+        assert stored.tenant_id == _PROVIDER_TENANT_ID
+        assert stored.event_id == "sanitized-webhook-event"
         assert json.loads(stored.payload) == json.loads(event_body)
 
 
@@ -196,13 +195,14 @@ def test_slack_webhook_maps_inbox_commit_failure_to_retryable_response(sqlite_en
 
     assert response.status_code == 503
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 0
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 0
 
 
 def test_slack_stream_connection_acks_only_the_event_committed_by_the_inbox(
     sqlite_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Given a Slack stream event, acknowledge it only after the inbox commits the event."""
     sink, session_maker = _build_sink(sqlite_engine)
     failed_request = SocketModeRequest(
         type="events_api",
@@ -216,7 +216,7 @@ def test_slack_stream_connection_acks_only_the_event_committed_by_the_inbox(
     )
 
     class _SocketTransport:
-        instance: _SocketTransport | None = None
+        instance: ClassVar[_SocketTransport | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -232,9 +232,9 @@ def test_slack_stream_connection_acks_only_the_event_committed_by_the_inbox(
 
         def send_socket_mode_response(self, response: SocketModeResponse) -> None:
             with session_maker() as session:
-                stored = session.scalar(sa.select(IMMessageInbox))
+                stored = session.scalar(sa.select(IMMessageEvent))
                 assert stored is not None
-                assert stored.provider_event_id == "sanitized-accepted-stream-event"
+                assert stored.event_id == "sanitized-accepted-stream-event"
             self.responses.append(response)
 
         def close(self) -> None:
@@ -261,7 +261,7 @@ def test_slack_stream_connection_acks_only_the_event_committed_by_the_inbox(
     assert transport is not None
     assert [response.to_dict() for response in transport.responses] == [{"envelope_id": "sanitized-accepted-envelope"}]
     with session_maker() as session:
-        assert session.scalar(sa.select(sa.func.count(IMMessageInbox.id))) == 1
+        assert session.scalar(sa.select(sa.func.count(IMMessageEvent.id))) == 1
 
     stream.stop()
 
@@ -272,6 +272,7 @@ def test_slack_webhook_and_stream_share_identified_callback_deduplication(
     sqlite_engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Given the same callback through webhook and stream, persist only one identified event."""
     sink, session_maker = _build_sink(sqlite_engine)
     consumer = _DelegatingConsumer(sink)
     adapter = SlackIMProviderAdapter(_credentials())
@@ -284,7 +285,7 @@ def test_slack_webhook_and_stream_share_identified_callback_deduplication(
     )
 
     class _SocketTransport:
-        instance: _SocketTransport | None = None
+        instance: ClassVar[_SocketTransport | None] = None
 
         def __init__(self, **kwargs: object) -> None:
             del kwargs
@@ -313,9 +314,9 @@ def test_slack_webhook_and_stream_share_identified_callback_deduplication(
     assert [response.to_dict() for response in transport.responses] == [{"envelope_id": "sanitized-shared-envelope"}]
     assert len(consumer.events) == 2
     with session_maker() as session:
-        records = list(session.scalars(sa.select(IMMessageInbox)))
+        records = list(session.scalars(sa.select(IMMessageEvent)))
         assert len(records) == 1
-        assert records[0].integration_id == str(_INTEGRATION_ID)
+        assert records[0].channel_id == str(_CHANNEL_ID)
         assert records[0].processed_at is None
         assert consumer.events[0].ingress_kind.value == "webhook"
         assert consumer.events[1].ingress_kind.value == "stream"

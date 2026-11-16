@@ -6,19 +6,21 @@ defaults a missing version to ``"1"``, rejects any other explicit version, and
 rejects duplicate node IDs. Its transport shape mirrors the frontend migration
 adapter so the generated client can replace the temporary mock without changing
 frontend orchestration.
-Public v2, trusted Service API v2, and legacy v1 submit DTOs stay independent.
+Public v2 keeps its email-proof DTO. Service API uses the existing form DTO for
+both node versions.
 """
 
 from __future__ import annotations
 
 from http import HTTPStatus
-from typing import Annotated, Literal, Self, Union
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, JsonValue, model_validator
 
 from controllers.common.human_input_v2_migration import LegacyHITLv1NodeData
 from core.human_input_v2.entities import (
     ContactId,
+    DebugChannel,
     HumanInputContactType,
     IMBindingId,
     IMBindingScope,
@@ -32,7 +34,6 @@ from core.human_input_v2.entities import (
     OrganizationCandidateId,
 )
 from core.workflow.nodes.human_input.entities import FormInputConfig, UserActionConfig
-from core.workflow.nodes.human_input_v2.entities import Channel
 from core.workflow.nodes.human_input_v2.entities import HumanInputNodeData as HITLv2NodeData
 from fields.base import ResponseModel
 from fields.pagination import PaginationParamsMixin, PaginationResultMixin
@@ -133,6 +134,7 @@ class HumanInputContactSummary(BaseModel):
 
     id: ContactId = Field(description="Unique contact identifier.")
     name: str = Field(description="Display name shown in the contact directory.")
+    email: str | None = Field(default=None, description="Primary contact email if one exists.")
     avatar_url: str = Field(default="", description="URL of the contact's avatar.")
     created_at: Timestamp = Field(description="Timestamp when the contact was created.")
 
@@ -166,6 +168,9 @@ class ContactOption(ResponseModel):
     name: str = Field(description="Display name shown in the contact picker.")
     avatar_url: str | None = Field(default=None, description="Signed avatar URL if one is available.")
     email: str | None = Field(default=None, description="Current deliverable Email, when available.")
+    im_providers: list[IMProvider] = Field(
+        description="Distinct providers of effective IM bindings in the current workspace; not a delivery health check."
+    )
 
 
 class ExternalContactCreateResponse(ResponseModel):
@@ -197,10 +202,29 @@ class ListContactOptionsResponse(PaginationResultMixin, ResponseModel):
     data: list[ContactOption] = Field(description="Selectable contacts returned for the current page.")
 
 
+class ContactIMIdentityDetail(BaseModel):
+    """Display fields for the identity selected by an effective contact binding."""
+
+    id: IMIdentityId
+    provider_user_id: str
+    display_name: str | None
+    email: str | None
+
+
+class ContactIMBindingDetail(BaseModel):
+    id: IMBindingId
+    provider: IMProvider
+    scope: IMBindingScope
+    identity: ContactIMIdentityDetail
+
+
 class GetContactResponse(ResponseModel):
     """Response body for one contact resolved in the current workspace scope."""
 
     contact: HumanInputContact = Field(description="Contact resolved as workspace, platform, or external.")
+    im_binding_details: list[ContactIMBindingDetail] = Field(
+        description="Effective IM bindings and their identities in the current workspace, for the contact detail view."
+    )
 
 
 class ListOrganizationCandidatesResponse(PaginationResultMixin, ResponseModel):
@@ -256,12 +280,15 @@ class IMSyncRunResultCounts(ResponseModel):
 class IMSyncRun(ResponseModel):
     """One IM sync run snapshot.
 
-    The latest-only UI displays ``finished_at`` as the explicit sync time. The
-    transport contract intentionally does not expose a ``started_by`` actor.
+    The latest-only UI displays ``finished_at`` as the explicit sync time.
+    The initiator display name is resolved from the initiating Dify Account.
     """
 
     id: IMSyncRunId = Field(description="Unique sync run identifier.")
     status: IMSyncRunStatus = Field(description="Current lifecycle state of the sync run.")
+    initiator_display_name: str = Field(
+        description="Current initiating Account name; empty for EE administrators or an unavailable Account."
+    )
     started_at: Timestamp | None = Field(
         default=None, description="Unix timestamp in seconds when the sync run started."
     )
@@ -281,9 +308,9 @@ class IMSyncRun(ResponseModel):
     )
     provider: IMProvider = Field(description="IM provider associated with the sync run.")
     channel_id: str = Field(description="Channel identifier captured when the sync run was created.")
-    integration_config_version: int = Field(
+    channel_config_version: int = Field(
         ge=1,
-        description="Integration configuration revision captured when the sync run was created.",
+        description="Channel configuration revision captured when the sync run was created.",
     )
 
 
@@ -368,13 +395,7 @@ class IMSyncResultNotMatched(BaseModel):
 
 
 IMSyncResult = Annotated[
-    Union[
-        IMSyncResultAdded,
-        IMSyncResultRemoved,
-        IMSyncResultFailed,
-        IMSyncResultNotMatched,
-        IMSyncResultSkipped,
-    ],
+    IMSyncResultAdded | IMSyncResultRemoved | IMSyncResultFailed | IMSyncResultNotMatched | IMSyncResultSkipped,
     Discriminator("type"),
 ]
 
@@ -475,10 +496,6 @@ class CreateIMBindingResponse(ResponseModel):
     contact: HumanInputContact = Field(description="Contact snapshot after the IM identity is bound.")
 
 
-class DeleteIMBindingQuery(_RequestModel):
-    binding_id: IMBindingId = Field(description="IM binding to unbind.")
-
-
 class DeleteIMBindingResponse(ResponseModel):
     pass
 
@@ -486,7 +503,7 @@ class DeleteIMBindingResponse(ResponseModel):
 class MessageTemplateTestRequest(_RequestModel):
     """Request body for sending one message-template test notification."""
 
-    channel: Channel = Field(description="Target debug delivery channel used for the test send.")
+    channel: DebugChannel = Field(description="Target debug delivery channel used for the test send.")
     inputs: dict[str, JsonValue] = Field(
         default_factory=dict,
         description="Variable values used when rendering the message template preview.",
@@ -519,12 +536,6 @@ class FormDefinitionResponse(ResponseModel):
         description="Action buttons that can complete the form.",
     )
     expiration_time: int = Field(description="Unix timestamp when the current form expires.")
-
-
-class ServiceFormQuery(_NoExtraModel):
-    """Query params for reading one service-api human-input form."""
-
-    user: str = Field(min_length=1, description="End-user identifier used to scope the service API request.")
 
 
 class BatchGetContactsQuery(_NoExtraModel):
@@ -564,14 +575,6 @@ class HumanInputV2FormSubmitRequest(_RequestModel):
         if has_challenge_token != has_otp_code:
             raise ValueError("challenge_token and otp_code must be provided together")
         return self
-
-
-class HumanInputV2ServiceFormSubmitRequest(_RequestModel):
-    """Trusted Service API submit payload without public-web OTP proof fields."""
-
-    inputs: dict[str, JsonValue] = Field(description="Submitted form values keyed by output variable name.")
-    action: str = Field(description="Identifier of the selected Human Input v2 action.")
-    user: str = Field(min_length=1, description="End-user identifier scoped to the current app token.")
 
 
 class FormUploadTokenResponse(ResponseModel):
@@ -677,7 +680,6 @@ __all__ = [
     "HumanInputContact",
     "HumanInputContactType",
     "HumanInputV2FormSubmitRequest",
-    "HumanInputV2ServiceFormSubmitRequest",
     "IMContactSyncErrorResponse",
     "IMIdentity",
     "IMIdentityBindingStatus",
@@ -705,7 +707,6 @@ __all__ = [
     "RemoveContactsRequest",
     "RemoveContactsResponse",
     "ResetContactIMOverrideResponse",
-    "ServiceFormQuery",
     "SetContactIMOverrideRequest",
     "SetContactIMOverrideResponse",
 ]

@@ -1,793 +1,921 @@
 'use client'
 
-import type { ContactRecipientOption, ContactRecipientOptionProvider } from '../contact-provider'
-import type { HumanInputV2RecipientType } from '../recipient-utils'
+import type { ContactOption } from '@dify/contracts/api/console/workspaces/types.gen'
 import type { HumanInputV2Recipient } from '../types'
-import type { ValueSelector, Var } from '@/app/components/workflow/types'
+import type { Node, Var } from '@/app/components/workflow/types'
 import { Button } from '@langgenius/dify-ui/button'
-import { cn } from '@langgenius/dify-ui/cn'
-import { Input } from '@langgenius/dify-ui/input'
+import {
+  Combobox,
+  ComboboxChip,
+  ComboboxChipRemove,
+  ComboboxChips,
+  ComboboxInput,
+  ComboboxInputGroup,
+  ComboboxItem,
+  ComboboxItemIndicator,
+  ComboboxList,
+  ComboboxPopup,
+  ComboboxPortal,
+  ComboboxPositioner,
+  ComboboxStatus,
+  ComboboxTrigger,
+  ComboboxValue,
+  createComboboxItems,
+} from '@langgenius/dify-ui/combobox'
+import { IconButton } from '@langgenius/dify-ui/icon-button'
+import { Infotip, InfotipContent, InfotipTitle, InfotipTrigger } from '@langgenius/dify-ui/infotip'
 import { Popover, PopoverContent, PopoverTrigger } from '@langgenius/dify-ui/popover'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { SegmentedControl, SegmentedControlItem } from '@langgenius/dify-ui/segmented-control'
+import { skipToken, useInfiniteQuery, useQuery } from '@tanstack/react-query'
+import { useDebounce } from 'ahooks'
+import { useAtomValue } from 'jotai'
+import { useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Infotip } from '@/app/components/base/infotip'
+import { WorkspaceAvatar } from '@/app/components/base/workspace-avatar'
 import VarReferencePicker from '@/app/components/workflow/nodes/_base/components/variable/var-reference-picker'
+import { VariableLabelInEditor } from '@/app/components/workflow/nodes/_base/components/variable/variable-label'
 import { VarType } from '@/app/components/workflow/types'
-import { useContactRecipientOptionProvider } from '../contact-provider'
+import {
+  currentWorkspaceAtom,
+  currentWorkspaceIdAtom,
+  isCurrentWorkspaceManagerAtom,
+} from '@/context/workspace-state'
+import { selectIMCentrallyManaged } from '@/features/contacts/im-capability'
+import { consoleQuery } from '@/service/console'
+import { getContactRecipientQueryOptions } from '../contact-queries'
 import {
   addRecipient,
-  createRecipientDraft,
+  findConflictingContact,
   getRecipientCanonicalKey,
   getRecipientValidationError,
   hasDuplicateRecipients,
-  removeRecipient,
-  updateRecipient,
+  replaceContactRecipient,
 } from '../recipient-utils'
+import { RecipientAvatar } from './recipient-avatar'
+import { RecipientContactPreview } from './recipient-contact-preview'
 
 type RecipientsProps = {
   nodeId: string
   value: HumanInputV2Recipient[]
   onChange: (value: HumanInputV2Recipient[]) => void
   readonly: boolean
-  provider?: ContactRecipientOptionProvider
+  isTriggerMode: boolean
+  availableNodes?: Node[]
 }
-
-const getOptionLabel = (option: ContactRecipientOption) =>
-  option.email ? `${option.name} · ${option.email}` : option.name
-
-type RecipientEditorState = {
-  index?: number
-  draft: HumanInputV2Recipient
+type SourceFilter = 'all' | 'workspace' | 'organization' | 'external'
+type RecipientItem = {
+  key: string
+  label: string
+  recipient: HumanInputV2Recipient
+  contact?: ContactOption
 }
-
-type ContactSourceFilter = 'all' | ContactRecipientOption['source']
-
-const recipientTypes: HumanInputV2RecipientType[] = [
-  'contact',
-  'dynamic_email',
-  'onetime_email',
-  'initiator',
-]
-
-const contactSourceFilters: ContactSourceFilter[] = ['all', 'workspace', 'organization', 'external']
-
-const cloneRecipient = (recipient: HumanInputV2Recipient): HumanInputV2Recipient => {
-  if (recipient.type === 'dynamic_email') return { ...recipient, selector: [...recipient.selector] }
-  return { ...recipient }
-}
+const sourceFilters: SourceFilter[] = ['all', 'workspace', 'organization', 'external']
+const getContactLabel = (contact: ContactOption) =>
+  contact.email ? `${contact.name} · ${contact.email}` : contact.name
 
 const RecipientsContent = ({
   nodeId,
   value,
   onChange,
   readonly,
-  provider,
-}: RecipientsProps & { provider: ContactRecipientOptionProvider }) => {
-  const { t } = useTranslation()
+  isTriggerMode,
+  availableNodes = [],
+  workspaceId,
+  workspace,
+}: RecipientsProps & {
+  workspaceId: string
+  workspace: { name: string; contactCount?: number }
+}) => {
+  const { t } = useTranslation(['workflow', 'contacts', 'common'])
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
-  const [options, setOptions] = useState<ContactRecipientOption[]>([])
-  const [sourceFilter, setSourceFilter] = useState<ContactSourceFilter>('all')
-  const [resolvedOptions, setResolvedOptions] = useState<ContactRecipientOption[]>([])
-  const [loading, setLoading] = useState(false)
-  const [loadError, setLoadError] = useState(false)
-  const [searchPage, setSearchPage] = useState(1)
-  const [hasMore, setHasMore] = useState(false)
-  const [loadingMore, setLoadingMore] = useState(false)
-  const searchRequestRef = useRef(0)
-  const searchQueryRef = useRef('')
-  const [emailDraft, setEmailDraft] = useState('')
+  const keyword = useDebounce(query.trim(), { wait: 300 })
+  const isDebouncing = keyword !== query.trim()
+  const [source, setSource] = useState<SourceFilter>('all')
   const [emailError, setEmailError] = useState(false)
-  const [editor, setEditor] = useState<RecipientEditorState>()
-  const [editorError, setEditorError] = useState<'invalid' | 'duplicate'>()
-  const firstOptionRef = useRef<HTMLButtonElement>(null)
-
-  const selectedKeys = useMemo(
-    () => new Set(value.map(getRecipientCanonicalKey).filter((key): key is string => !!key)),
-    [value],
+  const [highlighted, setHighlighted] = useState<string>()
+  const [previewContact, setPreviewContact] = useState<ContactOption>()
+  const inputRef = useRef<HTMLInputElement>(null)
+  const variableTriggerRef = useRef<HTMLButtonElement>(null)
+  const contactIds = value.flatMap((recipient) =>
+    recipient.type === 'contact' ? [recipient.contact_id] : [],
   )
-  const resolvedMap = useMemo(
-    () => new Map(resolvedOptions.map((option) => [option.id, option])),
-    [resolvedOptions],
+  const resolved = useQuery(getContactRecipientQueryOptions(workspaceId, contactIds))
+  const features = useQuery(
+    consoleQuery.features.get.queryOptions({ select: selectIMCentrallyManaged, retry: false }),
   )
-  const visibleOptions = useMemo(
-    () =>
-      sourceFilter === 'all' ? options : options.filter((option) => option.source === sourceFilter),
-    [options, sourceFilter],
+  const centrallyManaged = features.isSuccess && features.data
+  const activeSource = source === 'organization' && !centrallyManaged ? 'all' : source
+  const operation = consoleQuery.workspaces.current.humanInput.v2.contactOptions.get
+  const searchInput = workspaceId
+    ? (page: number) => ({ query: { keyword, page, limit: 20 } })
+    : skipToken
+  const search = useInfiniteQuery(
+    operation.infiniteOptions({
+      input: searchInput,
+      queryKey: [
+        ...operation.infiniteKey({ input: searchInput, initialPageParam: 1 }),
+        { workspaceId },
+      ],
+      initialPageParam: 1,
+      getNextPageParam: (page) => (page.page * page.limit < page.total ? page.page + 1 : undefined),
+      enabled: open,
+      context: { silent: true },
+      retry: false,
+    }),
   )
-  const recipientRows = useMemo(() => {
-    const occurrences = new Map<string, number>()
-    return value.map((recipient, index) => {
-      const baseKey =
-        getRecipientCanonicalKey(recipient) ?? `${recipient.type}:${JSON.stringify(recipient)}`
-      const occurrence = occurrences.get(baseKey) ?? 0
-      occurrences.set(baseKey, occurrence + 1)
-      return { recipient, index, key: `${baseKey}:${occurrence}` }
-    })
-  }, [value])
-
-  useEffect(() => {
-    const ids = [
-      ...new Set(
-        value
-          .filter(
-            (recipient): recipient is Extract<HumanInputV2Recipient, { type: 'contact' }> =>
-              recipient.type === 'contact',
+  const { selectedItems, results, itemMap, items } = useMemo(() => {
+    const contacts = search.data?.pages.flatMap((page) => page.data) ?? []
+    const selectedContacts = resolved.data?.data ?? []
+    const contactMap = new Map(
+      [...contacts, ...selectedContacts].map((contact) => [contact.id, contact]),
+    )
+    const labelFor = (recipient: HumanInputV2Recipient) => {
+      switch (recipient.type) {
+        case 'contact':
+          return contactMap.has(recipient.contact_id)
+            ? getContactLabel(contactMap.get(recipient.contact_id)!)
+            : resolved.isSuccess
+              ? t(($) => $['details.notFound'], { ns: 'contacts' })
+              : t(
+                  ($) =>
+                    $[
+                      resolved.isError
+                        ? 'nodes.humanInputV2.recipients.loadError'
+                        : 'nodes.humanInputV2.recipients.loading'
+                    ],
+                  { ns: 'workflow' },
+                )
+        case 'initiator':
+          return t(($) => $['nodes.humanInputV2.recipients.type.initiator'], { ns: 'workflow' })
+        case 'all_workspace_contacts':
+          return (
+            workspace.name ||
+            t(($) => $['nodes.humanInputV2.recipients.allWorkspaceContacts'], { ns: 'workflow' })
           )
-          .map((recipient) => recipient.contact_id),
-      ),
-    ]
-    if (!ids.length) return
-
-    let active = true
-    provider
-      .resolve({ contact_ids: ids })
-      .then((result) => {
-        if (active) setResolvedOptions(result)
-      })
-      .catch(() => {
-        if (active) setResolvedOptions([])
-      })
-    return () => {
-      active = false
-    }
-  }, [provider, value])
-
-  const loadOptions = useCallback(
-    async (nextQuery: string, page = 1) => {
-      const requestId = ++searchRequestRef.current
-      searchQueryRef.current = nextQuery
-      setLoading(page === 1)
-      setLoadingMore(page > 1)
-      setLoadError(false)
-      if (page === 1) {
-        setOptions([])
-        setHasMore(false)
+        case 'onetime_email':
+          return recipient.email
+        case 'dynamic_email':
+          return [
+            availableNodes.find((node) => node.id === recipient.selector[0])?.data.title,
+            ...recipient.selector.slice(1),
+          ]
+            .filter(Boolean)
+            .join(' / ')
       }
-      try {
-        const result = provider.searchPage
-          ? await provider.searchPage(nextQuery, page)
-          : { data: await provider.search(nextQuery), page: 1, hasMore: false }
-        if (requestId !== searchRequestRef.current) return
-        setOptions((current) =>
-          page === 1
-            ? result.data
-            : [
-                ...new Map(
-                  [...current, ...result.data].map((option) => [option.id, option]),
-                ).values(),
-              ],
+    }
+    const occurrences = new Map<string, number>()
+    const selectedItems: RecipientItem[] = value.map((recipient, index) => {
+      const canonical = getRecipientCanonicalKey(recipient) ?? `invalid:${index}`
+      const occurrence = occurrences.get(canonical) ?? 0
+      occurrences.set(canonical, occurrence + 1)
+      return {
+        key: occurrence ? `${canonical}:duplicate:${occurrence}` : canonical,
+        label: labelFor(recipient),
+        recipient,
+        contact: recipient.type === 'contact' ? contactMap.get(recipient.contact_id) : undefined,
+      }
+    })
+    const specialRecipients: HumanInputV2Recipient[] =
+      activeSource === 'all'
+        ? [{ type: 'initiator' }, { type: 'all_workspace_contacts' }]
+        : activeSource === 'workspace'
+          ? [{ type: 'all_workspace_contacts' }]
+          : []
+    const results: RecipientItem[] = [
+      ...contacts
+        .filter(
+          (contact) =>
+            activeSource === 'all' ||
+            contact.type === (activeSource === 'organization' ? 'platform' : activeSource),
         )
-        setSearchPage(result.page)
-        setHasMore(result.hasMore)
-      } catch {
-        if (requestId !== searchRequestRef.current) return
-        setLoadError(true)
-      } finally {
-        if (requestId === searchRequestRef.current) {
-          setLoading(false)
-          setLoadingMore(false)
-        }
-      }
-    },
-    [provider],
+        .map((contact) => ({
+          key: `contact:${contact.id}`,
+          label: getContactLabel(contact),
+          recipient: { type: 'contact' as const, contact_id: contact.id },
+          contact,
+        })),
+      ...specialRecipients
+        .filter(
+          (recipient) =>
+            !query.trim() ||
+            labelFor(recipient).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+        )
+        .map((recipient) => ({ key: recipient.type, label: labelFor(recipient), recipient })),
+    ]
+    const itemMap = new Map([...results, ...selectedItems].map((item) => [item.key, item]))
+    const items = createComboboxItems([...itemMap.values()], {
+      getValue: (item) => item.key,
+      getLabel: (item) => item.label,
+    })
+    return { selectedItems, results, itemMap, items }
+  }, [
+    search.data,
+    resolved.data,
+    resolved.isSuccess,
+    resolved.isError,
+    value,
+    activeSource,
+    query,
+    availableNodes,
+    t,
+    workspace.name,
+  ])
+  const selectedContacts = selectedItems.flatMap((item) => (item.contact ? [item.contact] : []))
+  const selectedKeys = selectedItems.map((item) => item.key)
+  const isUnavailableInitiator = (recipient: HumanInputV2Recipient) =>
+    isTriggerMode && recipient.type === 'initiator'
+  const initiatorUnavailableMessage = t(
+    ($) => $['nodes.humanInputV2.recipients.initiatorUnavailableInTriggerWorkflow'],
+    { ns: 'workflow' },
   )
-
-  const loadMore = () => {
-    if (!hasMore || loading || loadingMore) return
-    void loadOptions(searchQueryRef.current, searchPage + 1)
-  }
-
-  const handleOpenChange = (nextOpen: boolean) => {
+  const initiatorUnavailableId = `${nodeId}-initiator-unavailable`
+  const previewConflict =
+    previewContact &&
+    findConflictingContact(
+      value,
+      { id: previewContact.id, email: previewContact.email ?? '' },
+      selectedContacts.map((contact) => ({ ...contact, email: contact.email ?? '' })),
+    )
+  const commit = (next: HumanInputV2Recipient[]) => {
     if (readonly) return
-    setOpen(nextOpen)
-    if (nextOpen) {
-      setQuery('')
-      setSourceFilter('all')
-      void loadOptions('')
-    }
-  }
-
-  const add = (recipient: HumanInputV2Recipient) => {
-    const nextValue = addRecipient(value, recipient)
-    if (nextValue !== value) onChange(nextValue)
+    onChange(next)
+    setQuery('')
+    setEmailError(false)
     setOpen(false)
   }
-
-  const addOneTimeEmail = () => {
-    const recipient: HumanInputV2Recipient = { type: 'onetime_email', email: emailDraft.trim() }
-    const invalid = !!getRecipientValidationError(recipient)
-    const duplicate = selectedKeys.has(getRecipientCanonicalKey(recipient) || '')
-    setEmailError(invalid || duplicate)
-    if (invalid || duplicate) return
-    onChange([...value, recipient])
-    setEmailDraft('')
-  }
-
-  const openEditor = (index?: number) => {
-    if (index !== undefined && !value[index]) return
-    const draft =
-      index === undefined ? createRecipientDraft('onetime_email') : cloneRecipient(value[index]!)
-    setEditor({ index, draft })
-    setEditorError(undefined)
-    if (draft.type === 'contact') void loadOptions('')
-  }
-
-  const closeEditor = () => {
-    setEditor(undefined)
-    setEditorError(undefined)
-  }
-
-  const setEditorType = (type: HumanInputV2RecipientType) => {
-    setEditor((current) => current && { ...current, draft: createRecipientDraft(type) })
-    setEditorError(undefined)
-    if (type === 'contact') void loadOptions('')
-  }
-
-  const saveEditor = () => {
-    if (!editor) return
-    if (getRecipientValidationError(editor.draft)) {
-      setEditorError('invalid')
+  const addEmail = () => {
+    const additions: HumanInputV2Recipient[] = query
+      .split(',')
+      .map((email) => ({ type: 'onetime_email', email: email.trim() }))
+    if (
+      additions.some((recipient) => getRecipientValidationError(recipient)) ||
+      hasDuplicateRecipients([...value, ...additions])
+    ) {
+      setEmailError(true)
+      inputRef.current?.focus()
       return
     }
-
-    const draftKey = getRecipientCanonicalKey(editor.draft)
-    const duplicate = value.some(
-      (recipient, index) =>
-        index !== editor.index && getRecipientCanonicalKey(recipient) === draftKey,
-    )
-    if (duplicate) {
-      setEditorError('duplicate')
-      return
-    }
-
-    onChange(
-      editor.index === undefined
-        ? [...value, editor.draft]
-        : updateRecipient(value, editor.index, editor.draft),
-    )
-    closeEditor()
+    commit([...value, ...additions])
+    inputRef.current?.focus()
   }
-
-  const getRecipientLabel = (recipient: HumanInputV2Recipient) => {
-    if (recipient.type === 'initiator')
-      return t(($) => $['nodes.humanInputV2.recipients.initiator'], { ns: 'workflow' })
-    if (recipient.type === 'contact')
-      return resolvedMap.get(recipient.contact_id)
-        ? getOptionLabel(resolvedMap.get(recipient.contact_id)!)
-        : recipient.contact_id
-    if (recipient.type === 'dynamic_email') return recipient.selector.join(' / ')
-    return recipient.email
-  }
+  const infoName = (name: string) =>
+    t(($) => $['nodes.humanInputV2.recipients.contactInfo'], { ns: 'workflow', name })
+  const inputHint = t(($) => $['nodes.humanInputV2.recipients.selectionHint'], {
+    ns: 'workflow',
+    count: value.length,
+  })
+  const invalidMessage = t(($) => $['nodes.humanInputV2.error.recipientInvalid'], {
+    ns: 'workflow',
+  })
 
   return (
-    <section className="px-4 py-2" aria-labelledby={`${nodeId}-recipients-label`}>
-      <div className="mb-1 flex h-6 items-center gap-0.5">
+    <div className="nokey px-4 pt-2">
+      <div className="mb-1 flex min-h-6 items-center gap-0.5">
         <h3
           id={`${nodeId}-recipients-label`}
           className="system-sm-semibold-uppercase text-text-secondary"
         >
           {t(($) => $['nodes.humanInputV2.recipients.title'], { ns: 'workflow' })}
         </h3>
-        <Infotip aria-label={t(($) => $['nodes.humanInputV2.recipients.help'], { ns: 'workflow' })}>
-          {t(($) => $['nodes.humanInputV2.recipients.help'], { ns: 'workflow' })}
+        <Infotip>
+          <InfotipTrigger
+            aria-label={t(($) => $['nodes.humanInputV2.recipients.help'], { ns: 'workflow' })}
+          />
+          <InfotipContent>
+            {t(($) => $['nodes.humanInputV2.recipients.help'], { ns: 'workflow' })}
+          </InfotipContent>
         </Infotip>
       </div>
-
-      <div
-        className={cn(
-          'min-h-20 rounded-lg border border-components-input-border-active bg-components-input-bg-normal p-2',
-          readonly && 'opacity-70',
-        )}
-      >
-        {!!value.length && (
-          <div className="mb-2 flex flex-wrap gap-1" aria-live="polite">
-            {recipientRows.map(({ recipient, index, key }) => {
-              const invalid =
-                !!getRecipientValidationError(recipient) ||
-                (hasDuplicateRecipients(value) &&
-                  value.findIndex(
-                    (item) =>
-                      getRecipientCanonicalKey(item) === getRecipientCanonicalKey(recipient),
-                  ) !== index)
-              return (
-                <div
-                  key={key}
-                  className={cn(
-                    'flex min-h-5 max-w-full items-center gap-1 rounded-md bg-components-badge-bg-dimm px-1.5 py-0.5 system-xs-medium text-text-secondary',
-                    invalid && 'bg-state-destructive-hover text-text-destructive',
-                  )}
-                >
-                  <span className="max-w-[260px] truncate">{getRecipientLabel(recipient)}</span>
-                  {!readonly && (
-                    <>
-                      <button
-                        type="button"
-                        aria-label={t(($) => $['nodes.humanInputV2.recipients.edit'], {
-                          ns: 'workflow',
-                          recipient: getRecipientLabel(recipient) || recipient.type,
-                        })}
-                        className="flex size-4 shrink-0 items-center justify-center rounded-sm border-0 bg-transparent p-0 focus-visible:ring-1 focus-visible:ring-state-accent-solid"
-                        onClick={() => openEditor(index)}
-                      >
-                        <span className="i-ri-edit-line size-3" aria-hidden />
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={t(($) => $['nodes.humanInputV2.recipients.remove'], {
-                          ns: 'workflow',
-                          recipient: getRecipientLabel(recipient) || recipient.type,
-                        })}
-                        className="flex size-4 shrink-0 items-center justify-center rounded-sm border-0 bg-transparent p-0 focus-visible:ring-1 focus-visible:ring-state-accent-solid"
-                        onClick={() => onChange(removeRecipient(value, index))}
-                      >
-                        <span className="i-ri-close-line size-3" aria-hidden />
-                      </button>
-                    </>
-                  )}
-                  {invalid && (
-                    <span className="sr-only">
-                      {t(($) => $['nodes.humanInputV2.error.recipientInvalid'], {
-                        ns: 'workflow',
-                      })}
-                    </span>
-                  )}
-                </div>
+      <Combobox<string, true, RecipientItem>
+        multiple
+        modal={false}
+        readOnly={readonly}
+        items={items}
+        filteredItems={isDebouncing ? [] : results}
+        filter={null}
+        value={selectedKeys}
+        inputValue={query}
+        open={open}
+        onOpenChange={(next) => {
+          if (!readonly) {
+            setOpen(next)
+            if (!next) setQuery('')
+          }
+        }}
+        onInputValueChange={(next, details) => {
+          if (details.reason === 'input-change') setPreviewContact(undefined)
+          setQuery(next)
+          setEmailError(false)
+        }}
+        onItemHighlighted={(key) => {
+          setHighlighted(key)
+          if (key !== undefined) setPreviewContact(itemMap.get(key)?.contact)
+        }}
+        onValueChange={(next, details) => {
+          if (readonly || details.reason === 'escape-key') {
+            details.cancel()
+            return
+          }
+          const added = next.find((key) => !selectedKeys.includes(key))
+          if (added) {
+            const item = itemMap.get(added)
+            if (!item) return
+            if (isUnavailableInitiator(item.recipient)) {
+              details.cancel()
+              return
+            }
+            if (
+              item.contact &&
+              findConflictingContact(
+                value,
+                { id: item.contact.id, email: item.contact.email ?? '' },
+                selectedContacts.map((contact) => ({ ...contact, email: contact.email ?? '' })),
               )
-            })}
-          </div>
-        )}
-        {!readonly && (
-          <div className="flex items-center gap-1">
-            <Input
-              aria-label={t(($) => $['nodes.humanInputV2.recipients.emailLabel'], {
-                ns: 'workflow',
-              })}
-              value={emailDraft}
-              onChange={(event) => {
-                setEmailDraft(event.target.value)
-                setEmailError(false)
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault()
-                  addOneTimeEmail()
+            )
+              return
+            commit(addRecipient(value, item.recipient))
+          } else {
+            onChange(
+              selectedItems.filter((item) => next.includes(item.key)).map((item) => item.recipient),
+            )
+            if (details.reason !== 'item-press') setOpen(false)
+          }
+        }}
+      >
+        <ComboboxInputGroup className="min-h-20 flex-col items-stretch py-2 data-readonly:opacity-70">
+          <ComboboxValue<string, true>>
+            {() => (
+              <ComboboxChips
+                aria-label={
+                  value.length
+                    ? t(($) => $['nodes.humanInputV2.recipients.title'], { ns: 'workflow' })
+                    : undefined
                 }
-              }}
-              placeholder={t(($) => $['nodes.humanInputV2.recipients.placeholder'], {
-                ns: 'workflow',
-              })}
-              aria-invalid={emailError}
-              aria-describedby={emailError ? `${nodeId}-recipient-email-error` : undefined}
-              className="min-w-0 grow border-0 bg-transparent"
-            />
-            {!!emailDraft && (
-              <Button size="small" onClick={addOneTimeEmail}>
-                {t(($) => $['nodes.humanInputV2.recipients.addEmail'], { ns: 'workflow' })}
-              </Button>
-            )}
-          </div>
-        )}
-        {emailError && (
-          <div
-            id={`${nodeId}-recipient-email-error`}
-            role="alert"
-            className="mt-1 system-xs-regular text-text-destructive"
-          >
-            {t(($) => $['nodes.humanInputV2.recipients.emailInvalidOrDuplicate'], {
-              ns: 'workflow',
-            })}
-          </div>
-        )}
-        {!value.length && readonly && (
-          <div className="system-xs-regular text-text-tertiary">
-            {t(($) => $['nodes.humanInputV2.recipients.empty'], { ns: 'workflow' })}
-          </div>
-        )}
-      </div>
-
-      {editor && !readonly && (
-        <div
-          className="mt-2 space-y-2 rounded-lg border border-components-panel-border bg-components-panel-bg p-2"
-          role="group"
-          aria-labelledby={`${nodeId}-recipient-editor-title`}
-          aria-describedby={editorError ? `${nodeId}-recipient-editor-error` : undefined}
-        >
-          <div className="flex items-center justify-between gap-2">
-            <div
-              id={`${nodeId}-recipient-editor-title`}
-              className="system-xs-semibold-uppercase text-text-secondary"
-            >
-              {t(
-                ($) =>
-                  $[
-                    editor.index === undefined
-                      ? 'nodes.humanInputV2.recipients.addRecipient'
-                      : 'nodes.humanInputV2.recipients.editRecipient'
-                  ],
-                { ns: 'workflow' },
-              )}
-            </div>
-            <button
-              type="button"
-              className="flex size-5 items-center justify-center rounded-md border-0 bg-transparent focus-visible:ring-1 focus-visible:ring-state-accent-solid"
-              aria-label={t(($) => $['nodes.humanInputV2.recipients.cancel'], {
-                ns: 'workflow',
-              })}
-              onClick={closeEditor}
-            >
-              <span className="i-ri-close-line size-3.5" aria-hidden />
-            </button>
-          </div>
-
-          <div
-            className="flex flex-wrap gap-1"
-            role="group"
-            aria-label={t(($) => $['nodes.humanInputV2.recipients.typeLabel'], { ns: 'workflow' })}
-          >
-            {recipientTypes.map((type) => (
-              <button
-                key={type}
-                type="button"
-                aria-pressed={editor.draft.type === type}
-                className={cn(
-                  'rounded-md border border-components-button-secondary-border px-2 py-1 system-xs-medium text-text-secondary focus-visible:ring-1 focus-visible:ring-state-accent-solid',
-                  editor.draft.type === type &&
-                    'bg-state-accent-solid text-text-primary-on-surface',
-                )}
-                onClick={() => setEditorType(type)}
               >
-                {t(($) => $[`nodes.humanInputV2.recipients.type.${type}`], {
-                  ns: 'workflow',
-                })}
-              </button>
-            ))}
-          </div>
-
-          {editor.draft.type === 'onetime_email' && (
-            <Input
-              aria-label={t(($) => $['nodes.humanInputV2.recipients.emailLabel'], {
-                ns: 'workflow',
-              })}
-              aria-invalid={editorError === 'invalid'}
-              value={editor.draft.email}
-              onChange={(event) => {
-                setEditor((current) =>
-                  current && current.draft.type === 'onetime_email'
-                    ? { ...current, draft: { ...current.draft, email: event.target.value } }
-                    : current,
-                )
-                setEditorError(undefined)
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault()
-                  saveEditor()
-                }
-              }}
-            />
-          )}
-
-          {editor.draft.type === 'contact' && (
-            <div className="space-y-1">
-              <Input
-                aria-label={t(($) => $['nodes.humanInputV2.recipients.search'], {
-                  ns: 'workflow',
-                })}
-                placeholder={t(($) => $['nodes.humanInputV2.recipients.searchPlaceholder'], {
-                  ns: 'workflow',
-                })}
-                onChange={(event) => void loadOptions(event.target.value)}
-              />
-              <div className="max-h-32 overflow-y-auto">
-                {loading && (
-                  <div role="status" className="p-2 system-xs-regular text-text-tertiary">
-                    {t(($) => $['nodes.humanInputV2.recipients.loading'], { ns: 'workflow' })}
-                  </div>
-                )}
-                {!loading && loadError && (
-                  <div role="alert" className="p-2 system-xs-regular text-text-destructive">
-                    {t(($) => $['nodes.humanInputV2.recipients.loadError'], { ns: 'workflow' })}
-                  </div>
-                )}
-                {!loading &&
-                  options.map((option) => (
-                    <button
-                      key={option.id}
-                      type="button"
-                      aria-pressed={
-                        editor.draft.type === 'contact' && editor.draft.contact_id === option.id
-                      }
-                      className="flex w-full items-center justify-between rounded-md border-0 bg-transparent px-2 py-1 text-left system-xs-regular text-text-secondary hover:bg-state-base-hover focus-visible:bg-state-base-hover"
-                      onClick={() => {
-                        setEditor(
-                          (current) =>
-                            current && {
-                              ...current,
-                              draft: { type: 'contact', contact_id: option.id },
-                            },
-                        )
-                        setEditorError(undefined)
+                {selectedItems.map((item, index) => {
+                  const recipient = item.recipient
+                  const initiatorUnavailable = isUnavailableInitiator(recipient)
+                  const invalid =
+                    initiatorUnavailable ||
+                    !!getRecipientValidationError(recipient) ||
+                    value.findIndex(
+                      (other) =>
+                        getRecipientCanonicalKey(other) === getRecipientCanonicalKey(recipient),
+                    ) !== index ||
+                    (recipient.type === 'contact' &&
+                      resolved.isSuccess &&
+                      !(resolved.data?.data ?? []).some(
+                        (contact) => contact.id === recipient.contact_id,
+                      ))
+                  const recipientDetails =
+                    recipient.type === 'onetime_email'
+                      ? {
+                          title: t(($) => $['nodes.humanInputV2.recipients.emailLabel'], {
+                            ns: 'workflow',
+                          }),
+                          description: recipient.email,
+                        }
+                      : recipient.type === 'all_workspace_contacts'
+                        ? {
+                            title: item.label,
+                            description: t(
+                              ($) =>
+                                $['nodes.humanInputV2.recipients.allWorkspaceContactsDescription'],
+                              { ns: 'workflow' },
+                            ),
+                          }
+                        : undefined
+                  return (
+                    <ComboboxChip
+                      key={item.key}
+                      onKeyDown={(event) => {
+                        // The chip owns keys only while the chip itself is focused. Its
+                        // information button and portalled content own their own commands.
+                        if (event.target !== event.currentTarget) event.preventBaseUIHandler()
                       }}
+                      onFocus={() => {
+                        setPreviewContact(item.contact)
+                      }}
+                      aria-label={item.label}
+                      aria-description={
+                        readonly
+                          ? undefined
+                          : t(($) => $['nodes.humanInputV2.recipients.removeHint'], {
+                              ns: 'workflow',
+                            })
+                      }
+                      aria-invalid={invalid || undefined}
+                      aria-describedby={
+                        [
+                          initiatorUnavailable
+                            ? initiatorUnavailableId
+                            : invalid
+                              ? `${nodeId}-invalid-${index}`
+                              : undefined,
+                          recipient.type === 'contact' && !item.contact
+                            ? `${nodeId}-contact-${index}`
+                            : undefined,
+                        ]
+                          .filter(Boolean)
+                          .join(' ') || undefined
+                      }
+                      className="rounded-full aria-invalid:bg-state-destructive-hover aria-invalid:text-text-destructive data-[recipient-type=all_workspace_contacts]:bg-util-colors-indigo-indigo-100 data-[recipient-type=all_workspace_contacts]:text-util-colors-indigo-indigo-700 data-[recipient-type=dynamic_email]:bg-util-colors-blue-blue-50 data-[recipient-type=dynamic_email]:text-text-accent data-[recipient-type=initiator]:bg-util-colors-indigo-indigo-100 data-[recipient-type=initiator]:text-util-colors-indigo-indigo-700"
+                      data-recipient-type={recipient.type}
                     >
-                      <span>{getOptionLabel(option)}</span>
-                    </button>
-                  ))}
-                {hasMore && !loading && (
-                  <Button
-                    size="small"
-                    loading={loadingMore}
-                    disabled={loadingMore}
-                    onClick={loadMore}
-                  >
-                    {t(($) => $['common.loadMore'], { ns: 'workflow' })}
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {editor.draft.type === 'dynamic_email' && (
-            <div className="flex items-center justify-between gap-2 rounded-md bg-components-input-bg-normal px-2 py-1">
-              <span className="min-w-0 truncate system-xs-regular text-text-secondary">
-                {editor.draft.selector.length
-                  ? editor.draft.selector.join(' / ')
-                  : t(($) => $['nodes.humanInputV2.recipients.variableRequired'], {
+                      {recipient.type === 'initiator' && (
+                        <span
+                          className="flex size-4 shrink-0 items-center justify-center rounded-full bg-util-colors-indigo-indigo-500 text-text-primary-on-surface"
+                          aria-hidden
+                        >
+                          <span className="i-ri-user-follow-line size-3" />
+                        </span>
+                      )}
+                      {recipient.type === 'onetime_email' && !invalid && (
+                        <RecipientAvatar
+                          identity={recipient.email.trim().toLocaleLowerCase()}
+                          name={recipient.email}
+                          size="xxs"
+                        />
+                      )}
+                      {invalid && (
+                        <span className="i-ri-error-warning-fill size-3.5 shrink-0" aria-hidden />
+                      )}
+                      {item.contact && (
+                        <RecipientAvatar
+                          identity={item.contact.id}
+                          name={item.contact.name}
+                          avatar={item.contact.avatar_url}
+                          size="xxs"
+                        />
+                      )}
+                      {recipient.type === 'all_workspace_contacts' && workspace.name && (
+                        <span aria-hidden>
+                          <WorkspaceAvatar name={workspace.name} size="xs" />
+                        </span>
+                      )}
+                      {recipient.type === 'dynamic_email' ? (
+                        <VariableLabelInEditor
+                          variables={recipient.selector}
+                          nodeType={
+                            availableNodes.find((node) => node.id === recipient.selector[0])?.data
+                              .type
+                          }
+                          nodeTitle={
+                            availableNodes.find((node) => node.id === recipient.selector[0])?.data
+                              .title
+                          }
+                        />
+                      ) : (
+                        <span className="max-w-65 truncate">
+                          {item.contact?.name ?? item.label}
+                        </span>
+                      )}
+                      {recipient.type === 'all_workspace_contacts' &&
+                        workspace.contactCount !== undefined && (
+                          <span>{workspace.contactCount}</span>
+                        )}
+                      {invalid && !initiatorUnavailable && (
+                        <span id={`${nodeId}-invalid-${index}`} className="sr-only">
+                          {invalidMessage}
+                        </span>
+                      )}
+                      {recipient.type === 'contact' && !item.contact && (
+                        <span id={`${nodeId}-contact-${index}`} className="sr-only">
+                          {recipient.contact_id}
+                        </span>
+                      )}
+                      {item.contact && (
+                        <RecipientContactPreview contact={item.contact}>
+                          <IconButton size="xs" aria-label={infoName(item.contact.name)}>
+                            <span className="i-ri-information-line size-3" aria-hidden />
+                          </IconButton>
+                        </RecipientContactPreview>
+                      )}
+                      {!invalid && recipientDetails && (
+                        <Infotip>
+                          <InfotipTrigger
+                            aria-label={infoName(item.label)}
+                            iconVariant="information"
+                            iconSize="small"
+                          />
+                          <InfotipContent side="left" align="start">
+                            <InfotipTitle className="wrap-anywhere">
+                              {recipientDetails.title}
+                            </InfotipTitle>
+                            <p className="wrap-anywhere">{recipientDetails.description}</p>
+                          </InfotipContent>
+                        </Infotip>
+                      )}
+                      {!readonly && (
+                        <ComboboxChipRemove
+                          aria-label={t(($) => $['nodes.humanInputV2.recipients.remove'], {
+                            ns: 'workflow',
+                            recipient: item.label,
+                          })}
+                        />
+                      )}
+                    </ComboboxChip>
+                  )
+                })}
+                {!readonly && (
+                  <ComboboxInput
+                    ref={inputRef}
+                    aria-label={t(($) => $['nodes.humanInputV2.recipients.placeholder'], {
                       ns: 'workflow',
                     })}
+                    aria-describedby={`${nodeId}-selection-hint${emailError ? ` ${nodeId}-recipient-email-error` : ''}`}
+                    aria-invalid={emailError}
+                    placeholder={
+                      value.length
+                        ? ''
+                        : t(($) => $['nodes.humanInputV2.recipients.placeholder'], {
+                            ns: 'workflow',
+                          })
+                    }
+                    className="min-w-4 py-0.5"
+                    onKeyDown={(event) => {
+                      if (event.nativeEvent.isComposing) return
+                      // oxlint-disable-next-line typescript/no-deprecated -- Safari can report 229 without isComposing while confirming IME text.
+                      if (event.nativeEvent.keyCode === 229) return
+                      if (event.key === '/' && !query.trim()) {
+                        event.preventDefault()
+                        variableTriggerRef.current?.click()
+                      }
+                      if (
+                        event.key === 'Enter' &&
+                        query.trim() &&
+                        (!open || !highlighted) &&
+                        !event.defaultPrevented
+                      ) {
+                        event.preventDefault()
+                        const candidate =
+                          !query.includes(',') &&
+                          !isDebouncing &&
+                          !search.isFetching &&
+                          !search.isError &&
+                          results.find(
+                            (item) =>
+                              !value.some(
+                                (recipient) =>
+                                  getRecipientCanonicalKey(recipient) ===
+                                  getRecipientCanonicalKey(item.recipient),
+                              ) &&
+                              (!query.includes('@') ||
+                                item.contact?.email?.toLocaleLowerCase() ===
+                                  query.trim().toLocaleLowerCase()),
+                          )
+                        if (candidate && isUnavailableInitiator(candidate.recipient)) return
+                        if (
+                          candidate &&
+                          (!candidate.contact ||
+                            !findConflictingContact(
+                              value,
+                              { id: candidate.contact.id, email: candidate.contact.email ?? '' },
+                              selectedContacts.map((contact) => ({
+                                ...contact,
+                                email: contact.email ?? '',
+                              })),
+                            ))
+                        )
+                          commit(addRecipient(value, candidate.recipient))
+                        else addEmail()
+                      }
+                    }}
+                  />
+                )}
+              </ComboboxChips>
+            )}
+          </ComboboxValue>
+          <p id={`${nodeId}-selection-hint`} className="sr-only">
+            {inputHint}
+          </p>
+          {value.some(isUnavailableInitiator) && (
+            <p id={initiatorUnavailableId} className="px-1 system-xs-regular text-text-destructive">
+              {initiatorUnavailableMessage}
+            </p>
+          )}
+          {emailError && (
+            <p
+              id={`${nodeId}-recipient-email-error`}
+              role="alert"
+              className="px-1 system-xs-regular text-text-destructive"
+            >
+              {t(($) => $['nodes.humanInputV2.recipients.emailInvalidOrDuplicate'], {
+                ns: 'workflow',
+              })}
+            </p>
+          )}
+          {!value.length && readonly && (
+            <p className="px-1 system-xs-regular text-text-tertiary">
+              {t(($) => $['nodes.humanInputV2.recipients.empty'], { ns: 'workflow' })}
+            </p>
+          )}
+          {!readonly && (
+            <div className="flex items-center gap-1 pt-1">
+              <ComboboxTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="small"
+                    onClick={() => {
+                      inputRef.current?.focus()
+                    }}
+                  >
+                    <span className="i-ri-account-circle-line size-3.5" aria-hidden />
+                    {t(($) => $['nodes.humanInputV2.recipients.addContact'], { ns: 'workflow' })}
+                  </Button>
+                }
+              />
+              <Popover
+                onOpenChange={(next) => {
+                  if (next) setOpen(false)
+                }}
+              >
+                <PopoverTrigger
+                  render={
+                    <IconButton
+                      aria-label={t(($) => $['nodes.humanInputV2.recipients.contactSourceLabel'], {
+                        ns: 'workflow',
+                      })}
+                    >
+                      <span className="i-ri-filter-3-line size-4" aria-hidden />
+                    </IconButton>
+                  }
+                />
+                <PopoverContent>
+                  <SegmentedControl<SourceFilter>
+                    aria-label={t(($) => $['nodes.humanInputV2.recipients.contactSourceLabel'], {
+                      ns: 'workflow',
+                    })}
+                    value={activeSource}
+                    onValueChange={(next) => {
+                      setSource(next)
+                      setPreviewContact(undefined)
+                    }}
+                    className="m-1 shrink-0 overflow-x-auto"
+                  >
+                    {sourceFilters
+                      .filter((filter) => filter !== 'organization' || centrallyManaged)
+                      .map((filter) => (
+                        <SegmentedControlItem key={filter} value={filter}>
+                          {filter === 'organization'
+                            ? t(($) => $['type.platform'], { ns: 'contacts' })
+                            : t(($) => $[`nodes.humanInputV2.recipients.contactSource.${filter}`], {
+                                ns: 'workflow',
+                              })}
+                        </SegmentedControlItem>
+                      ))}
+                  </SegmentedControl>
+                </PopoverContent>
+              </Popover>
+              <RecipientContactPreview
+                contact={previewContact}
+                returnFocus={inputRef}
+                conflictingContact={
+                  previewConflict
+                    ? selectedContacts.find((contact) => contact.id === previewConflict.id)
+                    : undefined
+                }
+                onReplace={
+                  previewConflict && previewContact
+                    ? () => {
+                        commit(
+                          replaceContactRecipient(value, previewConflict.id, previewContact.id),
+                        )
+                        inputRef.current?.focus()
+                      }
+                    : undefined
+                }
+              >
+                <IconButton
+                  disabled={!previewContact}
+                  focusableWhenDisabled
+                  aria-label={t(($) => $['details.title'], { ns: 'contacts' })}
+                  aria-describedby={`${nodeId}-preview-contact`}
+                >
+                  <span className="i-ri-information-line size-4" aria-hidden />
+                </IconButton>
+              </RecipientContactPreview>
+              <span id={`${nodeId}-preview-contact`} className="sr-only">
+                {previewContact ? getContactLabel(previewContact) : inputHint}
               </span>
               <VarReferencePicker
                 nodeId={nodeId}
-                readonly={false}
-                value={editor.draft.selector}
+                readonly={readonly}
+                value={[]}
                 isShowNodeName
                 filterVar={(variable: Var) =>
-                  [VarType.string, VarType.secret].includes(variable.type)
+                  variable.type === VarType.string || variable.type === VarType.secret
                 }
                 trigger={
-                  <Button size="small">
-                    {t(($) => $['nodes.humanInputV2.recipients.chooseVariable'], {
+                  <Button ref={variableTriggerRef} variant="ghost" size="small">
+                    <span
+                      className="i-custom-vender-line-others-global-variable size-3.5"
+                      aria-hidden
+                    />
+                    {t(($) => $['nodes.humanInputV2.recipients.insertVariable'], {
                       ns: 'workflow',
                     })}
                   </Button>
                 }
                 onChange={(selector) => {
-                  if (!Array.isArray(selector)) return
-                  setEditor(
-                    (current) =>
-                      current && {
-                        ...current,
-                        draft: {
-                          type: 'dynamic_email',
-                          selector: selector as ValueSelector,
-                        },
-                      },
-                  )
-                  setEditorError(undefined)
+                  if (Array.isArray(selector))
+                    commit(addRecipient(value, { type: 'dynamic_email', selector }))
                 }}
               />
-            </div>
-          )}
-
-          {editor.draft.type === 'initiator' && (
-            <div className="rounded-md bg-components-input-bg-normal px-2 py-1.5 system-xs-regular text-text-secondary">
-              {t(($) => $['nodes.humanInputV2.recipients.initiatorDescription'], {
-                ns: 'workflow',
-              })}
-            </div>
-          )}
-
-          {editorError && (
-            <div
-              id={`${nodeId}-recipient-editor-error`}
-              role="alert"
-              className="system-xs-regular text-text-destructive"
-            >
-              {t(
-                ($) =>
-                  $[
-                    editorError === 'duplicate'
-                      ? 'nodes.humanInputV2.error.recipientDuplicate'
-                      : 'nodes.humanInputV2.error.recipientInvalid'
-                  ],
-                { ns: 'workflow' },
-              )}
-            </div>
-          )}
-
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" size="small" onClick={closeEditor}>
-              {t(($) => $['nodes.humanInputV2.recipients.cancel'], { ns: 'workflow' })}
-            </Button>
-            <Button size="small" onClick={saveEditor}>
-              {t(($) => $['nodes.humanInputV2.recipients.confirm'], { ns: 'workflow' })}
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {!readonly && (
-        <div className="mt-1 flex items-center gap-1">
-          <Button variant="ghost" size="small" onClick={() => openEditor()}>
-            <span className="i-ri-add-line size-3.5" aria-hidden />
-            {t(($) => $['nodes.humanInputV2.recipients.addRecipient'], { ns: 'workflow' })}
-          </Button>
-          <Popover open={open} onOpenChange={handleOpenChange}>
-            <PopoverTrigger
-              render={
-                <Button variant="ghost" size="small">
-                  <span className="i-ri-contacts-line size-3.5" aria-hidden />
-                  {t(($) => $['nodes.humanInputV2.recipients.addContact'], { ns: 'workflow' })}
+              {!open && query.includes('@') && (
+                <Button size="small" onClick={addEmail}>
+                  {t(($) => $['nodes.humanInputV2.recipients.addEmail'], { ns: 'workflow' })}
                 </Button>
-              }
-            />
-            <PopoverContent placement="bottom-start" sideOffset={4} className="w-80! p-1!">
-              <Input
-                aria-label={t(($) => $['nodes.humanInputV2.recipients.search'], { ns: 'workflow' })}
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value)
-                  void loadOptions(event.target.value)
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === 'ArrowDown') {
-                    event.preventDefault()
-                    firstOptionRef.current?.focus()
-                  }
-                  if (event.key === 'Enter') {
-                    const option = visibleOptions.find(
-                      (option) => !selectedKeys.has(`contact:${option.id}`),
-                    )
-                    if (option) add({ type: 'contact', contact_id: option.id })
-                  }
-                  if (event.key === 'Escape') setOpen(false)
-                }}
-                placeholder={t(($) => $['nodes.humanInputV2.recipients.searchPlaceholder'], {
-                  ns: 'workflow',
-                })}
-              />
-              <div
-                className="mt-1 flex gap-0.5 overflow-x-auto"
-                role="tablist"
+              )}
+              <Infotip>
+                <InfotipTrigger
+                  className="ms-auto"
+                  aria-label={t(($) => $['nodes.humanInputV2.recipients.inputHelp'], {
+                    ns: 'workflow',
+                  })}
+                />
+                <InfotipContent>
+                  {t(($) => $['nodes.humanInputV2.recipients.inputHelp'], { ns: 'workflow' })}
+                </InfotipContent>
+              </Infotip>
+            </div>
+          )}
+        </ComboboxInputGroup>
+        <ComboboxPortal>
+          <ComboboxPositioner align="start">
+            <ComboboxPopup>
+              <SegmentedControl<SourceFilter>
                 aria-label={t(($) => $['nodes.humanInputV2.recipients.contactSourceLabel'], {
                   ns: 'workflow',
                 })}
+                value={activeSource}
+                onValueChange={(next) => {
+                  setSource(next)
+                  setPreviewContact(undefined)
+                }}
+                className="m-1 shrink-0 overflow-x-auto"
               >
-                {contactSourceFilters.map((filter) => (
-                  <button
-                    key={filter}
-                    type="button"
-                    role="tab"
-                    aria-selected={sourceFilter === filter}
-                    className={cn(
-                      'shrink-0 rounded-md border-0 bg-transparent px-2 py-1 system-xs-medium text-text-tertiary focus-visible:ring-1 focus-visible:ring-state-accent-solid',
-                      sourceFilter === filter && 'bg-state-accent-active text-text-accent',
-                    )}
-                    onClick={() => setSourceFilter(filter)}
-                  >
-                    {t(($) => $[`nodes.humanInputV2.recipients.contactSource.${filter}`], {
-                      ns: 'workflow',
-                    })}
-                  </button>
-                ))}
-              </div>
-              <div className="mt-1 max-h-64 overflow-y-auto" aria-live="polite">
-                {loading && (
-                  <div role="status" className="p-3 system-xs-regular text-text-tertiary">
-                    {t(($) => $['nodes.humanInputV2.recipients.loading'], { ns: 'workflow' })}
-                  </div>
-                )}
-                {!loading && loadError && (
-                  <div role="alert" className="p-3 system-xs-regular text-text-destructive">
-                    {t(($) => $['nodes.humanInputV2.recipients.loadError'], { ns: 'workflow' })}
-                  </div>
-                )}
-                {!loading && !loadError && !visibleOptions.length && !hasMore && (
-                  <div className="p-3 system-xs-regular text-text-tertiary">
-                    {t(($) => $['nodes.humanInputV2.recipients.noResults'], { ns: 'workflow' })}
-                  </div>
-                )}
-                {!loading &&
-                  visibleOptions.map((option, index) => {
-                    const added = selectedKeys.has(`contact:${option.id}`)
-                    return (
-                      <button
-                        key={option.id}
-                        ref={index === 0 ? firstOptionRef : undefined}
-                        type="button"
-                        disabled={added}
-                        className="flex w-full items-center gap-2 rounded-lg border-0 bg-transparent px-2 py-1.5 text-left hover:bg-state-base-hover focus-visible:bg-state-base-hover disabled:opacity-50"
-                        onClick={() => add({ type: 'contact', contact_id: option.id })}
-                      >
-                        <span className="flex size-6 items-center justify-center rounded-full bg-components-icon-bg-blue-solid text-text-primary-on-surface">
-                          {option.name.slice(0, 1)}
-                        </span>
-                        <span className="min-w-0 grow">
-                          <span className="block truncate system-xs-medium text-text-secondary">
-                            {option.name}
+                {sourceFilters
+                  .filter((filter) => filter !== 'organization' || centrallyManaged)
+                  .map((filter) => (
+                    <SegmentedControlItem key={filter} value={filter}>
+                      {filter === 'organization'
+                        ? t(($) => $['type.platform'], { ns: 'contacts' })
+                        : t(($) => $[`nodes.humanInputV2.recipients.contactSource.${filter}`], {
+                            ns: 'workflow',
+                          })}
+                    </SegmentedControlItem>
+                  ))}
+              </SegmentedControl>
+              <ComboboxStatus>
+                {isDebouncing || search.isPending
+                  ? t(($) => $['nodes.humanInputV2.recipients.loading'], { ns: 'workflow' })
+                  : search.isError
+                    ? t(($) => $['nodes.humanInputV2.recipients.loadError'], { ns: 'workflow' })
+                    : t(($) => $['nodes.humanInputV2.recipients.resultCount'], {
+                        ns: 'workflow',
+                        count: results.length,
+                      })}
+              </ComboboxStatus>
+              <ComboboxList<RecipientItem>>
+                {(item) => {
+                  const initiatorUnavailable = isUnavailableInitiator(item.recipient)
+                  const added = value.some(
+                    (recipient) =>
+                      getRecipientCanonicalKey(recipient) ===
+                      getRecipientCanonicalKey(item.recipient),
+                  )
+                  const conflict =
+                    item.contact &&
+                    findConflictingContact(
+                      value,
+                      { id: item.contact.id, email: item.contact.email ?? '' },
+                      selectedContacts.map((contact) => ({
+                        ...contact,
+                        email: contact.email ?? '',
+                      })),
+                    )
+                  return (
+                    <ComboboxItem<string>
+                      key={item.key}
+                      value={item.key}
+                      disabled={initiatorUnavailable || added || !!conflict}
+                      aria-label={initiatorUnavailable ? item.label : undefined}
+                      aria-describedby={
+                        initiatorUnavailable ? `${initiatorUnavailableId}-option` : undefined
+                      }
+                      className={
+                        initiatorUnavailable
+                          ? 'min-w-0 grow data-disabled:opacity-100'
+                          : 'min-w-0 grow'
+                      }
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        {item.contact && (
+                          <RecipientAvatar
+                            identity={item.contact.id}
+                            name={item.contact.name}
+                            avatar={item.contact.avatar_url}
+                            size="sm"
+                          />
+                        )}
+                        <span className="min-w-0">
+                          <span
+                            className={
+                              initiatorUnavailable
+                                ? 'block truncate system-sm-medium text-text-disabled'
+                                : 'block truncate system-sm-medium'
+                            }
+                          >
+                            {item.contact?.name ?? item.label}
                           </span>
-                          <span className="block truncate system-xs-regular text-text-tertiary">
-                            {option.email}
-                          </span>
+                          {initiatorUnavailable && (
+                            <span
+                              id={`${initiatorUnavailableId}-option`}
+                              className="block system-xs-regular wrap-break-word text-text-tertiary"
+                            >
+                              {initiatorUnavailableMessage}
+                            </span>
+                          )}
+                          {item.contact?.email && (
+                            <span className="block truncate system-xs-regular text-text-tertiary">
+                              {item.contact.email}
+                            </span>
+                          )}
                         </span>
-                        {added && (
-                          <span className="system-xs-regular text-text-tertiary">
-                            {t(($) => $['nodes.humanInputV2.recipients.added'], { ns: 'workflow' })}
+                        {conflict && (
+                          <span className="sr-only">
+                            {t(($) => $['nodes.humanInputV2.recipients.emailAlreadySelected'], {
+                              ns: 'workflow',
+                            })}
                           </span>
                         )}
-                      </button>
-                    )
-                  })}
-                {hasMore && !loading && (
-                  <Button
-                    size="small"
-                    loading={loadingMore}
-                    disabled={loadingMore}
-                    onClick={loadMore}
-                  >
-                    {t(($) => $['common.loadMore'], { ns: 'workflow' })}
-                  </Button>
-                )}
-                <div className="my-1 h-px bg-divider-subtle" />
-                <button
-                  type="button"
-                  disabled={selectedKeys.has('initiator')}
-                  className="flex w-full items-center gap-2 rounded-lg border-0 bg-transparent px-2 py-2 text-left hover:bg-state-base-hover disabled:opacity-50"
-                  onClick={() => add({ type: 'initiator' })}
+                      </span>
+                      <ComboboxItemIndicator />
+                    </ComboboxItem>
+                  )
+                }}
+              </ComboboxList>
+              {query.includes('@') && (
+                <Button size="small" onClick={addEmail}>
+                  {t(($) => $['nodes.humanInputV2.recipients.addEmail'], { ns: 'workflow' })}
+                </Button>
+              )}
+              {search.isError && (
+                <Button size="small" onClick={() => void search.refetch()}>
+                  {t(($) => $['operation.retry'], { ns: 'common' })}
+                </Button>
+              )}
+              {(search.hasNextPage || (search.data?.pages.length ?? 0) > 1) && (
+                <Button
+                  size="small"
+                  loading={search.isFetchingNextPage}
+                  aria-disabled={!search.hasNextPage || search.isFetchingNextPage}
+                  onClick={() => {
+                    if (search.hasNextPage && !search.isFetchingNextPage)
+                      void search.fetchNextPage()
+                  }}
                 >
-                  <span className="i-ri-user-line size-5 text-text-secondary" aria-hidden />
-                  <span className="system-xs-medium text-text-secondary">
-                    {t(($) => $['nodes.humanInputV2.recipients.initiator'], { ns: 'workflow' })}
-                  </span>
-                </button>
-              </div>
-            </PopoverContent>
-          </Popover>
-
-          <VarReferencePicker
-            nodeId={nodeId}
-            readonly={readonly}
-            value={[]}
-            isShowNodeName
-            filterVar={(variable: Var) => [VarType.string, VarType.secret].includes(variable.type)}
-            trigger={
-              <Button variant="ghost" size="small">
-                <span className="i-ri-add-line size-3.5" aria-hidden />
-                {t(($) => $['nodes.humanInputV2.recipients.insertVariable'], { ns: 'workflow' })}
-              </Button>
-            }
-            onChange={(selector) => {
-              if (!Array.isArray(selector)) return
-              const next = addRecipient(value, {
-                type: 'dynamic_email',
-                selector: selector as ValueSelector,
-              })
-              if (next !== value) onChange(next)
-            }}
-          />
-        </div>
-      )}
-    </section>
+                  {t(($) => $['common.loadMore'], { ns: 'workflow' })}
+                </Button>
+              )}
+            </ComboboxPopup>
+          </ComboboxPositioner>
+        </ComboboxPortal>
+      </Combobox>
+    </div>
   )
 }
 
-const RuntimeRecipients = (props: RecipientsProps) => {
-  const { provider, workspaceId } = useContactRecipientOptionProvider()
+const Recipients = (props: RecipientsProps) => {
+  const workspaceId = useAtomValue(currentWorkspaceIdAtom)
+  const workspace = useAtomValue(currentWorkspaceAtom)
+  const canManage = useAtomValue(isCurrentWorkspaceManagerAtom)
+  const operation = consoleQuery.workspaces.current.humanInput.v2.contacts.get
+  const input =
+    workspaceId && canManage
+      ? { query: { group: 'workspace' as const, page: 1, limit: 1 } }
+      : skipToken
+  const count = useQuery(
+    operation.queryOptions({
+      input,
+      queryKey: [...operation.queryKey({ input }), { workspaceId }],
+      select: (response) => response.total,
+      context: { silent: true },
+      retry: false,
+    }),
+  )
   return (
     <RecipientsContent
       key={workspaceId}
       {...props}
       readonly={props.readonly || !workspaceId}
-      provider={provider}
+      workspaceId={workspaceId}
+      workspace={{ name: workspace.name, contactCount: canManage ? count.data : undefined }}
     />
   )
 }
-
-const Recipients = (props: RecipientsProps) =>
-  props.provider ? (
-    <RecipientsContent {...props} provider={props.provider} />
-  ) : (
-    <RuntimeRecipients {...props} />
-  )
 
 export default Recipients

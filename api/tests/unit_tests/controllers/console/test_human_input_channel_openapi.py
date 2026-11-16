@@ -3,25 +3,29 @@ from __future__ import annotations
 import pytest
 from flask import Flask
 
-_CHANNEL_PATH_PREFIX = "/workspace/current/human-input/v2"
+_CHANNEL_PATH_PREFIX = "/workspaces/current/human-input/v2"
 _HTTP_METHODS = {"delete", "get", "patch", "post", "put"}
 _EXPECTED_OPERATIONS = {
     f"{_CHANNEL_PATH_PREFIX}/channel-providers": {"get"},
     f"{_CHANNEL_PATH_PREFIX}/channels": {"get"},
     f"{_CHANNEL_PATH_PREFIX}/channels/email": {"post"},
     f"{_CHANNEL_PATH_PREFIX}/channels/email/test": {"post"},
+    f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}/test": {"post"},
     f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}": {"delete", "get", "put"},
     f"{_CHANNEL_PATH_PREFIX}/channels/im": {"post"},
     f"{_CHANNEL_PATH_PREFIX}/channels/im/test": {"post"},
+    f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}/test": {"post"},
     f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}": {"delete", "get", "put"},
     f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}/replacement": {"post"},
 }
 _EXPECTED_REQUEST_REFS = {
     (f"{_CHANNEL_PATH_PREFIX}/channels/email", "post"): "EmailChannelCreatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/test", "post"): "EmailChannelTestPayload",
+    (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}/test", "post"): "EmailChannelUpdatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}", "put"): "EmailChannelUpdatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im", "post"): "IMChannelCreatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/test", "post"): "IMChannelTestPayload",
+    (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}/test", "post"): "IMChannelUpdatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}", "put"): "IMChannelUpdatePayload",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}/replacement", "post"): "IMChannelReplacementPayload",
 }
@@ -30,11 +34,13 @@ _EXPECTED_RESPONSE_REFS = {
     (f"{_CHANNEL_PATH_PREFIX}/channels", "get"): "ListChannelsResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email", "post"): "EmailChannelMutationResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/test", "post"): "ChannelTestResponse",
+    (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}/test", "post"): "ChannelTestResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}", "get"): "EmailChannelDetailResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}", "put"): "EmailChannelMutationResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/email/{{channel_id}}", "delete"): "ChannelDeleteResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im", "post"): "IMChannelMutationResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/test", "post"): "ChannelTestResponse",
+    (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}/test", "post"): "ChannelTestResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}", "get"): "IMChannelDetailResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}", "put"): "IMChannelMutationResponse",
     (f"{_CHANNEL_PATH_PREFIX}/channels/im/{{channel_id}}", "delete"): "ChannelDeleteResponse",
@@ -89,7 +95,7 @@ def test_channel_openapi_uses_only_canonical_routes_and_registered_dtos(
     channel_paths = {
         path: {method for method in path_item if method in _HTTP_METHODS}
         for path, path_item in paths.items()
-        if isinstance(path, str) and path.startswith(_CHANNEL_PATH_PREFIX) and isinstance(path_item, dict)
+        if isinstance(path, str) and path.startswith(f"{_CHANNEL_PATH_PREFIX}/channel") and isinstance(path_item, dict)
     }
 
     assert channel_paths == _EXPECTED_OPERATIONS

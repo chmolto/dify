@@ -4,10 +4,12 @@ import type { NodeDefault } from '@/app/components/workflow/types'
 import { BlockClassification } from '@/app/components/workflow/block-selector/types'
 import { BlockEnum } from '@/app/components/workflow/types'
 import { genNodeMetaData } from '@/app/components/workflow/utils'
+import { ENABLE_HITL_IM } from '@/config'
 import {
   buildHumanInputOutputVars,
   getHumanInputSharedValidationError,
 } from '../human-input/shared/default-utils'
+import { getRequestURLCount } from './message-template-utils'
 import { getRecipientValidationError, hasDuplicateRecipients } from './recipient-utils'
 import { isHumanInputV2DebugChannel } from './types'
 
@@ -32,13 +34,38 @@ const nodeDefault: NodeDefault<HumanInputV2NodeType> = {
     timeout: 36,
     timeout_unit: 'hour',
   },
-  checkValid(payload, t: TFunction<'workflow'>) {
+  checkValid(
+    payload,
+    t: TFunction<['workflow']>,
+    moreDataForCheckValid?: {
+      resolvedContactIds?: ReadonlySet<string>
+      contactLookupFailed?: boolean
+    },
+  ) {
+    const { resolvedContactIds, contactLookupFailed } = moreDataForCheckValid ?? {}
     let errorMessage = ''
-    if (payload.version !== '2')
+    if (!ENABLE_HITL_IM)
+      errorMessage = t(($) => $['nodes.humanInputV2.disabled'], { ns: 'workflow' })
+    else if (payload.version !== '2')
       errorMessage = t(($) => $['nodes.humanInputV2.error.version'], { ns: 'workflow' })
     else if (!payload.recipients_spec.length)
       errorMessage = t(($) => $['nodes.humanInputV2.error.recipientRequired'], { ns: 'workflow' })
     else if (payload.recipients_spec.some(getRecipientValidationError))
+      errorMessage = t(($) => $['nodes.humanInputV2.error.recipientInvalid'], { ns: 'workflow' })
+    else if (
+      contactLookupFailed &&
+      payload.recipients_spec.some((recipient) => recipient.type === 'contact')
+    )
+      errorMessage = t(($) => $['nodes.humanInputV2.error.recipientVerificationFailed'], {
+        ns: 'workflow',
+      })
+    else if (
+      resolvedContactIds &&
+      payload.recipients_spec.some(
+        (recipient) =>
+          recipient.type === 'contact' && !resolvedContactIds.has(recipient.contact_id),
+      )
+    )
       errorMessage = t(($) => $['nodes.humanInputV2.error.recipientInvalid'], { ns: 'workflow' })
     else if (hasDuplicateRecipients(payload.recipients_spec))
       errorMessage = t(($) => $['nodes.humanInputV2.error.recipientDuplicate'], { ns: 'workflow' })
@@ -46,6 +73,10 @@ const nodeDefault: NodeDefault<HumanInputV2NodeType> = {
       errorMessage = t(($) => $['nodes.humanInputV2.error.subjectRequired'], { ns: 'workflow' })
     else if (!payload.message_template.body.trim())
       errorMessage = t(($) => $['nodes.humanInputV2.error.bodyRequired'], { ns: 'workflow' })
+    else if (getRequestURLCount(payload.message_template.body) === 0)
+      errorMessage = t(($) => $['nodes.humanInputV2.error.requestURLRequired'], { ns: 'workflow' })
+    else if (getRequestURLCount(payload.message_template.body) > 1)
+      errorMessage = t(($) => $['nodes.humanInputV2.error.requestURLDuplicate'], { ns: 'workflow' })
     else if (
       payload.debug_mode.enabled &&
       !payload.debug_mode.channels.some(isHumanInputV2DebugChannel)

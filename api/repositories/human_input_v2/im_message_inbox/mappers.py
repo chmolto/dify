@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from core.human_input_v2.entities import IMProvider
 from core.human_input_v2.im_integration.adapters.entities import AuthenticatedIMEvent
 from core.human_input_v2.im_message_inbox import IMInboxRecord, IMInboxRecordId
-from core.human_input_v2.shared import IntegrationId
-from models.human_input_v2 import IMMessageInbox
+from models.human_input_v2 import IMMessageEvent
+from repositories.human_input_v2.im_channel_repository import IMChannelId
 
 
 def _naive_utc(timestamp: datetime) -> datetime:
@@ -18,35 +18,37 @@ def _naive_utc(timestamp: datetime) -> datetime:
 def event_record(
     *,
     record_id: IMInboxRecordId,
-    integration_id: IntegrationId,
+    channel_id: IMChannelId,
     event: AuthenticatedIMEvent,
     now: datetime,
-) -> IMMessageInbox:
+    request_ip_address: str | None = None,
+) -> IMMessageEvent:
     """Create one detached record containing immutable callback facts."""
 
-    record = IMMessageInbox(
-        integration_id=str(integration_id),
+    record = IMMessageEvent(
+        channel_id=str(channel_id),
         provider=event.provider,
-        provider_tenant_id=event.provider_tenant_id,
-        provider_event_id=event.event_id,
+        tenant_id=event.provider_tenant_id,
+        event_id=event.event_id,
         provider_event_time=event.occurred_at,
         received_at=event.received_at,
         provider_event_type=event.event_type,
         ingress_kind=event.ingress_kind,
         payload=event.payload,
+        request_ip_address=request_ip_address,
     )
     record.id = str(record_id)
     record.created_at = _naive_utc(now)
     return record
 
 
-def event_from_record(record: IMMessageInbox) -> AuthenticatedIMEvent:
+def event_from_record(record: IMMessageEvent) -> AuthenticatedIMEvent:
     """Reconstruct the exact authenticated Provider callback facts."""
 
     return AuthenticatedIMEvent(
         provider=IMProvider(record.provider),
-        provider_tenant_id=record.provider_tenant_id,
-        event_id=record.provider_event_id,
+        provider_tenant_id=record.tenant_id,
+        event_id=record.event_id,
         event_type=record.provider_event_type,
         occurred_at=record.provider_event_time,
         received_at=record.received_at,
@@ -55,12 +57,13 @@ def event_from_record(record: IMMessageInbox) -> AuthenticatedIMEvent:
     )
 
 
-def inbox_record_from_model(record: IMMessageInbox) -> IMInboxRecord:
+def inbox_record_from_model(record: IMMessageEvent) -> IMInboxRecord:
     """Convert one database record at the repository trust boundary."""
 
     return IMInboxRecord(
         record_id=IMInboxRecordId(record.id),
-        integration_id=IntegrationId(record.integration_id),
+        channel_id=IMChannelId(record.channel_id),
         event=event_from_record(record),
         processed_at=record.processed_at,
+        request_ip_address=record.request_ip_address,
     )

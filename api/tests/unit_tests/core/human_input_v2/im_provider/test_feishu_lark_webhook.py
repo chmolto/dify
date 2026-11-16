@@ -61,13 +61,15 @@ class _Consumer:
         self.acceptance = acceptance
         self.events: list[AuthenticatedIMEvent] = []
 
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         self.events.append(event)
         return self.acceptance
 
 
 class _FailingConsumer:
-    def accept(self, event: AuthenticatedIMEvent) -> EventAcceptance:
+    def accept(self, event: AuthenticatedIMEvent, *, request_ip_address: str | None = None) -> EventAcceptance:
+        del request_ip_address
         del event
         raise RuntimeError("sensitive consumer details")
 
@@ -194,7 +196,9 @@ def test_authenticated_plaintext_event_preserves_complete_payload_and_acks_after
     ],
     ids=("microseconds", "milliseconds", "malformed", "overflow"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_authenticated_webhook_event_maps_confirmed_timestamp_units_safely(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     create_time: str,
     expected: datetime | None,
@@ -202,7 +206,7 @@ def test_authenticated_webhook_event_maps_confirmed_timestamp_units_safely(
     consumer = _Consumer()
     handler = _adapter(
         monkeypatch,
-        IMProvider.FEISHU,
+        provider,
         _Gateway(["tenant_sanitized"]),
         encrypt_key=None,
     ).create_webhook_handler(consumer)
@@ -215,9 +219,11 @@ def test_authenticated_webhook_event_maps_confirmed_timestamp_units_safely(
 
 
 @pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
-def test_plaintext_business_event_without_auth_material_fails_closed(
+@pytest.mark.parametrize("include_token", [False, True], ids=("missing-token", "unconfigured-token"))
+def test_plaintext_business_event_without_optional_authentication_is_accepted(
     monkeypatch: pytest.MonkeyPatch,
     provider: IMProvider,
+    include_token: bool,
 ) -> None:
     gateway = _Gateway(["tenant_sanitized"])
     consumer = _Consumer()
@@ -228,20 +234,31 @@ def test_plaintext_business_event_without_auth_material_fails_closed(
         verification_token=None,
         encrypt_key=None,
     ).create_webhook_handler(consumer)
+    payload = json.loads(_event_body(token="unconfigured-token"))
+    if not include_token:
+        del payload["header"]["token"]
+    body = json.dumps(payload).encode()
 
-    response = handler.handle(WebhookRequest("POST", (), _event_body(), _RECEIVED_AT))
+    response = handler.handle(WebhookRequest("POST", (), body, _RECEIVED_AT))
 
-    assert response.status_code != 200
-    assert consumer.events == []
-    assert gateway.calls == []
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"code": 0}
+    assert len(consumer.events) == 1
+    event = consumer.events[0]
+    assert event.provider is provider
+    assert event.provider_tenant_id == "tenant_sanitized"
+    assert event.event_id == "evt_sanitized_event"
+    assert event.payload == body.decode()
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_encrypted_event_authenticates_exact_envelope_and_exposes_only_plaintext(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway(["tenant_sanitized"])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     plaintext = json.dumps(json.loads(_event_body()), ensure_ascii=False, indent=2).encode()
     assert b"\n" in plaintext
     body = json.dumps({"encrypt": _encrypt(plaintext)}, separators=(",", ":")).encode()
@@ -256,12 +273,14 @@ def test_encrypted_event_authenticates_exact_envelope_and_exposes_only_plaintext
     assert "encrypt" not in json.loads(event.payload)
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_signed_event_treats_timestamp_as_opaque_signature_material(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway(["tenant_sanitized"])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
 
     response = handler.handle(_signed_request(body, timestamp="opaque-provider-timestamp"))
@@ -275,14 +294,16 @@ def test_signed_event_treats_timestamp_as_opaque_signature_material(
     [("", "sanitized-nonce"), ("opaque-provider-timestamp", "")],
     ids=("empty-timestamp", "empty-nonce"),
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_signed_event_preserves_official_sdk_empty_signature_material_semantics(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     timestamp: str,
     nonce: str,
 ) -> None:
     gateway = _Gateway(["tenant_sanitized"])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
 
     response = handler.handle(_signed_request(body, timestamp=timestamp, nonce=nonce))
@@ -291,12 +312,14 @@ def test_signed_event_preserves_official_sdk_empty_signature_material_semantics(
     assert len(consumer.events) == 1
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_tampered_signature_never_reaches_consumer(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
 
     response = handler.handle(_signed_request(body, signature="0" * 64))
@@ -306,12 +329,14 @@ def test_tampered_signature_never_reaches_consumer(
     assert gateway.calls == []
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_empty_signature_never_reaches_consumer_or_gateway(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
     request = _signed_request(body, signature="")
 
@@ -323,10 +348,11 @@ def test_empty_signature_never_reaches_consumer_or_gateway(
     assert gateway.calls == []
 
 
-def test_signature_is_bound_to_exact_request_body(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_signature_is_bound_to_exact_request_body(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
     signed = _signed_request(body)
     modified = WebhookRequest(signed.method, signed.headers, signed.body + b" ", signed.received_at)
@@ -342,13 +368,15 @@ def test_signature_is_bound_to_exact_request_body(monkeypatch: pytest.MonkeyPatc
     "header_name",
     ["X-Lark-Request-Timestamp", "X-Lark-Request-Nonce", "X-Lark-Signature"],
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_signed_event_requires_exactly_one_signature_tuple_header(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     header_name: str,
 ) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
     signed = _signed_request(body)
     header = next(header for header in signed.headers if header[0] == header_name)
@@ -371,12 +399,14 @@ def test_signed_event_requires_exactly_one_signature_tuple_header(
     assert gateway.calls == []
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_replayed_signed_delivery_is_forwarded_to_the_durable_consumer(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway(["tenant_sanitized", "tenant_sanitized"])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps({"encrypt": _encrypt(_event_body())}, separators=(",", ":")).encode()
     request = _signed_request(body)
 
@@ -388,10 +418,13 @@ def test_replayed_signed_delivery_is_forwarded_to_the_durable_consumer(
     assert len(consumer.events) == 2
 
 
-def test_wrong_encryption_material_never_reaches_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_wrong_encryption_material_never_reaches_consumer(
+    monkeypatch: pytest.MonkeyPatch, provider: IMProvider
+) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps(
         {"encrypt": _encrypt(_event_body(), encrypt_key="sanitized-wrong-encrypt-key")},
         separators=(",", ":"),
@@ -404,10 +437,11 @@ def test_wrong_encryption_material_never_reaches_consumer(monkeypatch: pytest.Mo
     assert gateway.calls == []
 
 
-def test_wrong_verification_token_never_reaches_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_wrong_verification_token_never_reaches_consumer(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway, encrypt_key=None).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway, encrypt_key=None).create_webhook_handler(consumer)
 
     response = handler.handle(WebhookRequest("POST", (), _event_body(token="wrong-token"), _RECEIVED_AT))
 
@@ -416,10 +450,11 @@ def test_wrong_verification_token_never_reaches_consumer(monkeypatch: pytest.Mon
     assert gateway.calls == []
 
 
-def test_cross_tenant_webhook_never_reaches_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
+def test_cross_tenant_webhook_never_reaches_consumer(monkeypatch: pytest.MonkeyPatch, provider: IMProvider) -> None:
     gateway = _Gateway(["tenant_other"])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway, encrypt_key=None).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway, encrypt_key=None).create_webhook_handler(consumer)
 
     response = handler.handle(WebhookRequest("POST", (), _event_body(), _RECEIVED_AT))
 
@@ -428,12 +463,14 @@ def test_cross_tenant_webhook_never_reaches_consumer(monkeypatch: pytest.MonkeyP
     assert gateway.calls == ["query_tenant"]
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_url_challenge_returns_exact_challenge_without_consumer_or_remote_io(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway, encrypt_key=None).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway, encrypt_key=None).create_webhook_handler(consumer)
     body = json.dumps(
         {"type": "url_verification", "token": _VERIFICATION_TOKEN, "challenge": "sanitized-challenge"},
         separators=(",", ":"),
@@ -447,12 +484,14 @@ def test_url_challenge_returns_exact_challenge_without_consumer_or_remote_io(
     assert gateway.calls == []
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_url_challenge_does_not_require_business_event_signature(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _Gateway([])
     consumer = _Consumer()
-    handler = _adapter(monkeypatch, IMProvider.FEISHU, gateway).create_webhook_handler(consumer)
+    handler = _adapter(monkeypatch, provider, gateway).create_webhook_handler(consumer)
     body = json.dumps(
         {"type": "url_verification", "token": _VERIFICATION_TOKEN, "challenge": "sanitized-challenge"},
         separators=(",", ":"),
@@ -470,14 +509,16 @@ def test_url_challenge_does_not_require_business_event_signature(
     ("consumer", "expected_status"),
     [(_Consumer(EventAcceptance.NOT_ACCEPTED), 503), (_FailingConsumer(), 503)],
 )
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_consumer_must_accept_before_successful_ack(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
     consumer: _Consumer | _FailingConsumer,
     expected_status: int,
 ) -> None:
     handler = _adapter(
         monkeypatch,
-        IMProvider.FEISHU,
+        provider,
         _Gateway(["tenant_sanitized"]),
         encrypt_key=None,
     ).create_webhook_handler(consumer)
@@ -488,13 +529,15 @@ def test_consumer_must_accept_before_successful_ack(
     assert response.body == b'{"code":1}'
 
 
+@pytest.mark.parametrize("provider", [IMProvider.FEISHU, IMProvider.LARK])
 def test_webhook_handler_is_independent_of_root_close_and_safe_for_concurrent_requests(
+    provider: IMProvider,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_count = 8
     gateway = _Gateway(["tenant_sanitized"] * request_count)
     consumer = _Consumer()
-    adapter = _adapter(monkeypatch, IMProvider.FEISHU, gateway, encrypt_key=None)
+    adapter = _adapter(monkeypatch, provider, gateway, encrypt_key=None)
     handler = adapter.create_webhook_handler(consumer)
     adapter.close()
     request = WebhookRequest("POST", (), _event_body(), _RECEIVED_AT)

@@ -4,7 +4,7 @@ import importlib
 from datetime import datetime
 from http import HTTPStatus
 from inspect import unwrap
-from types import SimpleNamespace
+from typing import Never
 from unittest.mock import patch
 from uuid import UUID
 
@@ -15,10 +15,10 @@ from werkzeug.exceptions import Forbidden
 from controllers.console.human_input_v2.config_version import encode_email_config_version
 from controllers.console.wraps import _is_setup_completed
 from core.human_input_v2.entities import EmailProviderType, IMProvider
-from core.human_input_v2.shared import EmailProviderId
+from core.human_input_v2.shared import AccountId, DirectoryScope, EmailProviderId, WorkspaceScope
 from libs.exception import BaseHTTPException
 from models.account import Account, AccountStatus, TenantAccountRole
-from repositories.human_input_v2.email_channel import EmailChannelView, EmailConfigurationSnapshot
+from repositories.human_input_v2.email_channel import EmailChannelView, EmailConfigurationSnapshot, ResendCandidate
 from repositories.human_input_v2.im_channel_repository import IMChannelId, IMChannelStatus
 from services.human_input_v2.errors import (
     ChannelAlreadyConfiguredError,
@@ -30,17 +30,20 @@ from services.human_input_v2.errors import (
     UnexpectedChannelProviderError,
 )
 from services.human_input_v2.im_channel_service import IMChannelView
+from tests.helpers.unit.model_factories import make_tenant
 
 _CANONICAL_ROUTES = {
-    "/workspace/current/human-input/v2/channel-providers": {"GET"},
-    "/workspace/current/human-input/v2/channels": {"GET"},
-    "/workspace/current/human-input/v2/channels/email": {"POST"},
-    "/workspace/current/human-input/v2/channels/email/test": {"POST"},
-    "/workspace/current/human-input/v2/channels/email/<uuid:channel_id>": {"GET", "PUT", "DELETE"},
-    "/workspace/current/human-input/v2/channels/im": {"POST"},
-    "/workspace/current/human-input/v2/channels/im/test": {"POST"},
-    "/workspace/current/human-input/v2/channels/im/<uuid:channel_id>": {"GET", "PUT", "DELETE"},
-    "/workspace/current/human-input/v2/channels/im/<uuid:channel_id>/replacement": {"POST"},
+    "/workspaces/current/human-input/v2/channel-providers": {"GET"},
+    "/workspaces/current/human-input/v2/channels": {"GET"},
+    "/workspaces/current/human-input/v2/channels/email": {"POST"},
+    "/workspaces/current/human-input/v2/channels/email/test": {"POST"},
+    "/workspaces/current/human-input/v2/channels/email/<uuid:channel_id>/test": {"POST"},
+    "/workspaces/current/human-input/v2/channels/email/<uuid:channel_id>": {"GET", "PUT", "DELETE"},
+    "/workspaces/current/human-input/v2/channels/im": {"POST"},
+    "/workspaces/current/human-input/v2/channels/im/test": {"POST"},
+    "/workspaces/current/human-input/v2/channels/im/<uuid:channel_id>/test": {"POST"},
+    "/workspaces/current/human-input/v2/channels/im/<uuid:channel_id>": {"GET", "PUT", "DELETE"},
+    "/workspaces/current/human-input/v2/channels/im/<uuid:channel_id>/replacement": {"POST"},
 }
 
 
@@ -56,18 +59,18 @@ def test_canonical_route_inventory_has_no_kind_specific_discovery_authority() ->
     registered_routes: dict[str, set[str]] = {}
 
     for resource, urls, _route_doc, _kwargs in module.console_ns.resources:
-        resource_methods = {
+        resource_methods: set[str] = {
             method.upper() for method in ("get", "post", "put", "patch", "delete") if method in resource.__dict__
         }
         for url in urls:
-            if url.startswith("/workspace/current/human-input/v2"):
+            if url.startswith("/workspaces/current/human-input/v2/channel"):
                 registered_routes[url] = resource_methods
 
     assert registered_routes == _CANONICAL_ROUTES
-    assert "/workspace/current/human-input/v2/channels/email" not in {
+    assert "/workspaces/current/human-input/v2/channels/email" not in {
         route for route, methods in registered_routes.items() if "GET" in methods
     }
-    assert "/workspace/current/human-input/v2/channels/im" not in {
+    assert "/workspaces/current/human-input/v2/channels/im" not in {
         route for route, methods in registered_routes.items() if "GET" in methods
     }
 
@@ -97,9 +100,11 @@ def test_channel_transport_models_match_the_canonical_schema() -> None:
     assert set(module.ListChannelProvidersResponse.model_fields) == {"email_providers", "im_providers"}
     assert set(module.ChannelProvider.model_fields) == {"provider", "connection_mode"}
     assert set(module.ChannelDeleteResponse.model_fields) == {"channel_id"}
-    assert set(module.EmailChannelTestPayload.model_fields) == {"credentials"}
-    assert set(module.EmailChannelCreatePayload.model_fields) == {"credentials"}
+    assert set(module.EmailChannelTestPayload.model_fields) == {"sender_email", "sender_name", "credentials"}
+    assert set(module.EmailChannelCreatePayload.model_fields) == {"sender_email", "sender_name", "credentials"}
     assert set(module.EmailChannelUpdatePayload.model_fields) == {
+        "sender_email",
+        "sender_name",
         "credentials",
         "expected_config_version",
     }
@@ -177,7 +182,7 @@ def test_kind_mismatch_is_a_generic_not_found_response(
     service_error = ChannelNotFoundError("the identifier belongs to another kind")
 
     class EmailOwner:
-        def get(self, _scope, _channel_id):
+        def get(self, _scope: DirectoryScope, _channel_id: EmailProviderId) -> Never:
             raise service_error
 
     monkeypatch.setattr(
@@ -226,7 +231,7 @@ def test_email_create_translates_expected_errors_with_cause(
     module = importlib.import_module("controllers.console.human_input_v2.channel")
 
     class EmailOwner:
-        def create(self, *_args):
+        def create(self, *_args: object) -> Never:
             raise service_error
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)
@@ -237,12 +242,9 @@ def test_email_create_translates_expected_errors_with_cause(
         app.test_request_context(
             method="POST",
             json={
-                "credentials": {
-                    "provider": "resend",
-                    "sender_email": "sender@example.com",
-                    "sender_name": "Dify",
-                    "api_key": "resend-secret",
-                }
+                "credentials": {"provider": "resend", "api_key": "resend-secret"},
+                "sender_email": "sender@example.com",
+                "sender_name": "Dify",
             },
         ),
         pytest.raises(BaseHTTPException) as error_info,
@@ -290,7 +292,7 @@ def test_im_update_translates_conflicts_with_cause(
     channel_id = IMChannelId("00000000-0000-0000-0000-000000000001")
 
     class IMOwner:
-        def update(self, *_args):
+        def update(self, *_args: object) -> Never:
             raise service_error
 
     monkeypatch.setattr(module, "_workspace_im_channel_service", lambda *_args: IMOwner())
@@ -339,7 +341,7 @@ def test_im_update_decodes_the_opaque_version_before_calling_the_owner(
     expected_config_version = 7
 
     class IMOwner:
-        def update(self, addressed_id, config_version, _credentials):
+        def update(self, addressed_id: IMChannelId, config_version: int, _credentials: object) -> Never:
             assert addressed_id == channel_id
             assert config_version == expected_config_version
             raise ReplacementRequiredError("replacement required")
@@ -381,7 +383,7 @@ def test_unexpected_provider_error_is_not_rewrapped(
     service_error = UnexpectedChannelProviderError()
 
     class EmailOwner:
-        def create(self, *_args):
+        def create(self, *_args: object) -> Never:
             raise service_error
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)
@@ -392,12 +394,9 @@ def test_unexpected_provider_error_is_not_rewrapped(
         app.test_request_context(
             method="POST",
             json={
-                "credentials": {
-                    "provider": "resend",
-                    "sender_email": "sender@example.com",
-                    "sender_name": "Dify",
-                    "api_key": "resend-secret",
-                }
+                "credentials": {"provider": "resend", "api_key": "resend-secret"},
+                "sender_email": "sender@example.com",
+                "sender_name": "Dify",
             },
         ),
         pytest.raises(UnexpectedChannelProviderError) as error_info,
@@ -431,7 +430,10 @@ def test_create_returns_the_resulting_canonical_summary(
     )
 
     class EmailOwner:
-        def create(self, scope, actor_account_id, candidate):
+        def create(
+            self, scope: DirectoryScope, actor_account_id: AccountId, candidate: ResendCandidate
+        ) -> EmailChannelView:
+            assert isinstance(scope, WorkspaceScope)
             assert str(scope.id) == "workspace-1"
             assert str(actor_account_id) == "account-1"
             assert candidate.sender_name == "Dify"
@@ -448,12 +450,9 @@ def test_create_returns_the_resulting_canonical_summary(
     with app.test_request_context(
         method="POST",
         json={
-            "credentials": {
-                "provider": "resend",
-                "sender_email": "sender@example.com",
-                "sender_name": "Dify",
-                "api_key": "resend-secret",
-            }
+            "credentials": {"provider": "resend", "api_key": "resend-secret"},
+            "sender_email": "sender@example.com",
+            "sender_name": "Dify",
         },
     ):
         response = unwrap(module.EmailChannelCreateApi.post)(
@@ -465,8 +464,8 @@ def test_create_returns_the_resulting_canonical_summary(
     assert response == {
         "summary": {
             "id": "00000000-0000-0000-0000-000000000001",
-            "created_at": 1787184000,
-            "updated_at": 1787187600,
+            "created_at": 1787212800,
+            "updated_at": 1787216400,
             "kind": "email",
             "provider": "resend",
             "status": "configured",
@@ -486,23 +485,21 @@ def test_email_candidate_test_delegates_the_submitted_candidate_without_a_recipi
     module = importlib.import_module("controllers.console.human_input_v2.channel")
 
     class EmailOwner:
-        def test(self, scope, candidate):
+        def test(self, scope: DirectoryScope, candidate: ResendCandidate) -> None:
+            assert isinstance(scope, WorkspaceScope)
             assert str(scope.id) == "workspace-1"
             assert str(candidate.sender_email) == "sender@example.com"
             assert candidate.sender_name == "Dify"
-            assert candidate.api_key == "resend-secret"
+            assert candidate.credentials.api_key == "resend-secret"
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)
 
     with app.test_request_context(
         method="POST",
         json={
-            "credentials": {
-                "provider": "resend",
-                "sender_email": "sender@example.com",
-                "sender_name": "Dify",
-                "api_key": "resend-secret",
-            }
+            "credentials": {"provider": "resend", "api_key": "resend-secret"},
+            "sender_email": "sender@example.com",
+            "sender_name": "Dify",
         },
     ):
         response = unwrap(module.EmailChannelTestApi.post)(
@@ -539,12 +536,13 @@ def test_channel_collection_aggregates_configured_owner_snapshots(
     )
 
     class EmailOwner:
-        def get_current(self, scope):
+        def get_current(self, scope: DirectoryScope) -> EmailChannelView:
+            assert isinstance(scope, WorkspaceScope)
             assert str(scope.id) == "workspace-1"
             return email_snapshot
 
     class IMOwner:
-        def get_current(self):
+        def get_current(self) -> IMChannelView:
             return im_snapshot
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)
@@ -568,11 +566,11 @@ def test_channel_collection_omits_unconfigured_owner_snapshots(
     module = importlib.import_module("controllers.console.human_input_v2.channel")
 
     class EmailOwner:
-        def get_current(self, _scope):
+        def get_current(self, _scope: DirectoryScope) -> None:
             return None
 
     class IMOwner:
-        def get_current(self):
+        def get_current(self) -> None:
             return None
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)
@@ -591,7 +589,7 @@ def test_composite_guard_rejects_a_non_admin_workspace_member(
 ) -> None:
     module = importlib.import_module("controllers.console.human_input_v2.channel")
     account = Account(name="Editor", email="editor@example.com", status=AccountStatus.ACTIVE)
-    account._current_tenant = SimpleNamespace(id="workspace-1")
+    account._current_tenant = make_tenant(tenant_id="workspace-1", name="Workspace")
     account.role = TenantAccountRole.EDITOR
     _is_setup_completed.mark_success()
 
@@ -624,16 +622,16 @@ def test_composite_guard_allows_a_workspace_owner(
 ) -> None:
     module = importlib.import_module("controllers.console.human_input_v2.channel")
     account = Account(name="Owner", email="owner@example.com", status=AccountStatus.ACTIVE)
-    account._current_tenant = SimpleNamespace(id="workspace-1")
+    account._current_tenant = make_tenant(tenant_id="workspace-1", name="Workspace")
     account.role = TenantAccountRole.OWNER
     _is_setup_completed.mark_success()
 
     class EmailOwner:
-        def available_providers(self):
+        def available_providers(self) -> tuple[EmailProviderType, ...]:
             return (EmailProviderType.RESEND,)
 
     class IMOwner:
-        def available_providers(self):
+        def available_providers(self) -> tuple[IMProvider, ...]:
             return ()
 
     monkeypatch.setattr(module, "build_human_input_email_channel_management_service", EmailOwner)

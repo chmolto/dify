@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import pytest
@@ -13,6 +13,7 @@ from repositories.human_input_v2.email_channel import (
     EmailProviderValidationError,
     ResendCandidate,
 )
+from repositories.human_input_v2.email_channel.entities import ResendCredentials
 from services.human_input_v2.resend_channel import ResendProviderGateway
 
 
@@ -21,7 +22,7 @@ class FakeResponse:
     status_code: int
     body: object
 
-    def json(self):
+    def json(self) -> object:
         if isinstance(self.body, Exception):
             raise self.body
         return self.body
@@ -32,10 +33,10 @@ class FakeHTTPClient:
         self.responses = list(responses)
         self.calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def post(self, url: str, **kwargs: object):
+    def post(self, url: str, **kwargs: object) -> FakeResponse:
         return self._request("POST", url, kwargs)
 
-    def _request(self, method: str, url: str, kwargs: dict[str, object]):
+    def _request(self, method: str, url: str, kwargs: dict[str, object]) -> FakeResponse:
         self.calls.append((method, url, kwargs))
         result = self.responses.pop(0)
         if isinstance(result, Exception):
@@ -47,7 +48,7 @@ def _candidate() -> ResendCandidate:
     return ResendCandidate(
         sender_email=NormalizedEmail("approvals@example.com"),
         sender_name="Approvals",
-        api_key="re_secret",
+        credentials=ResendCredentials(api_key="re_secret"),
     )
 
 
@@ -64,9 +65,11 @@ def test_send_test_uses_resend_test_recipient_once_with_unique_idempotency_key()
     method, url, kwargs = http_client.calls[0]
     assert method == "POST"
     assert url == "https://api.resend.com/emails"
-    assert kwargs["headers"]["Idempotency-Key"] == "human-input-channel-test/test-1"
-    assert kwargs["headers"]["Authorization"] == "Bearer re_secret"
-    assert kwargs["headers"]["User-Agent"] == "Dify-Human-Input/1.0"
+    headers = kwargs["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Idempotency-Key"] == "human-input-channel-test/test-1"
+    assert headers["Authorization"] == "Bearer re_secret"
+    assert headers["User-Agent"] == "Dify-Human-Input/1.0"
     assert kwargs["max_retries"] == 0
     assert kwargs["json"] == {
         "from": "Approvals <approvals@example.com>",
@@ -77,6 +80,23 @@ def test_send_test_uses_resend_test_recipient_once_with_unique_idempotency_key()
             "<p>You can close this email after confirming delivery.</p>"
         ),
     }
+
+
+def test_send_test_rejects_invalid_credentials_after_a_successful_test() -> None:
+    http_client = FakeHTTPClient(
+        FakeResponse(200, {"id": "email-1"}),
+        FakeResponse(403, {"name": "invalid_api_key"}),
+    )
+    gateway = ResendProviderGateway(http_client=http_client)
+
+    gateway.send_test(_candidate())
+    with pytest.raises(EmailProviderValidationError):
+        gateway.send_test(replace(_candidate(), credentials=ResendCredentials(api_key="re_invalid")))
+
+    for (_, _, kwargs), api_key in zip(http_client.calls, ("re_secret", "re_invalid"), strict=True):
+        headers = kwargs["headers"]
+        assert isinstance(headers, dict)
+        assert headers["Authorization"] == f"Bearer {api_key}"
 
 
 @pytest.mark.parametrize(
@@ -98,7 +118,11 @@ def test_send_test_uses_resend_test_recipient_once_with_unique_idempotency_key()
         (FakeResponse(200, {}), EmailProviderOperationError, "provider_response_malformed"),
     ],
 )
-def test_send_test_maps_provider_responses_to_safe_failures(response, exception_type, code: str) -> None:
+def test_send_test_maps_provider_responses_to_safe_failures(
+    response: FakeResponse,
+    exception_type: type[EmailProviderValidationError] | type[EmailProviderOperationError],
+    code: str,
+) -> None:
     gateway = ResendProviderGateway(http_client=FakeHTTPClient(response))
 
     with pytest.raises(exception_type) as raised:
@@ -117,3 +141,46 @@ def test_transport_failure_is_classified_without_credential_material() -> None:
 
     assert raised.value.code == "provider_timeout"
     assert "re_secret" not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    "name", ["restricted_api_key", "validation_error", "monthly_quota_exceeded", "new_provider_error"]
+)
+def test_provider_error_preserves_original_resend_code_without_raw_message(name: str) -> None:
+    gateway = ResendProviderGateway(
+        http_client=FakeHTTPClient(
+            FakeResponse(
+                403,
+                {
+                    "name": name,
+                    "message": "raw response containing re_secret",
+                },
+            )
+        )
+    )
+
+    with pytest.raises((EmailProviderValidationError, EmailProviderOperationError)) as captured:
+        gateway.send_test(_candidate())
+
+    assert captured.value.provider_error_code == name
+    assert "re_secret" not in repr(captured.value)
+
+
+def test_send_message_uses_rendered_content_and_selected_channel_credentials() -> None:
+    http_client = FakeHTTPClient(FakeResponse(200, {"id": "email-1"}))
+    gateway = ResendProviderGateway(http_client=http_client, id_factory=lambda: "message-1")
+
+    gateway.send_message(_candidate(), to="editor@example.com", subject="Rendered subject", html="<p>Rendered body</p>")
+
+    assert len(http_client.calls) == 1
+    _, _, kwargs = http_client.calls[0]
+    assert kwargs["json"] == {
+        "from": "Approvals <approvals@example.com>",
+        "to": ["editor@example.com"],
+        "subject": "Rendered subject",
+        "html": "<p>Rendered body</p>",
+    }
+    headers = kwargs["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Idempotency-Key"] == "human-input-message/message-1"
+    assert kwargs["max_retries"] == 0

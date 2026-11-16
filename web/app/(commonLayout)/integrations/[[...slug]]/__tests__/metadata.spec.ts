@@ -6,8 +6,8 @@ vi.mock('@/app/components/integrations', () => ({
   default: () => null,
 }))
 
-vi.mock('@/i18n-config/server', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/i18n-config/server')>()),
+vi.mock('@/i18n/server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/i18n/server')>()),
   getLocaleOnServer: async () => 'en-US',
 }))
 
@@ -20,6 +20,7 @@ describe('integrations route metadata', () => {
     [['tools', 'mcp'], 'MCP · Integrations'],
     [['data-source'], 'Data Source · Integrations'],
     [['custom-endpoint'], 'Custom Endpoint · Integrations'],
+    [['file-scan'], 'File Security Scan · Integrations'],
     [['trigger'], 'Trigger · Integrations'],
     [['agent-strategy'], 'Agent Strategy · Integrations'],
     [['extension'], 'Extension · Integrations'],
