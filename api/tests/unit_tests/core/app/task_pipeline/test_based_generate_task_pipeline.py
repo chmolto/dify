@@ -21,7 +21,7 @@ from core.errors.error import QuotaExceededError
 from core.plugin.impl.exc import PluginDaemonInternalError, PluginInvokeError, PluginRuntimeError
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError, InvokeError, InvokeRateLimitError
 from models.enums import ConversationFromSource, MessageStatus
-from models.enums import InvokeFrom as ModelInvokeFrom
+from models.enums import InvokeFrom as ModelsInvokeFrom
 from models.model import AppMode, Message
 
 
@@ -45,7 +45,7 @@ def _persist_message(session: Session, *, message_id: str) -> Message:
         status=MessageStatus.NORMAL,
         error=None,
         message_metadata=None,
-        invoke_from=ModelInvokeFrom.WEB_APP,
+        invoke_from=ModelsInvokeFrom.WEB_APP,
         from_source=ConversationFromSource.CONSOLE,
         from_end_user_id=None,
         from_account_id="account-1",
@@ -229,11 +229,11 @@ class TestBasedGenerateTaskPipeline:
         }
 
     def test_handle_output_moderation_when_flagged(
-        self, pipeline: BasedGenerateTaskPipeline[AppGenerateEntity]
+        self, pipeline: BasedGenerateTaskPipeline[AppGenerateEntity], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         handler = Mock()
         handler.moderation_completion.return_value = ("filtered", True)
-        pipeline.output_moderation_handler = handler
+        monkeypatch.setattr(pipeline, "output_moderation_handler", handler)
 
         result = pipeline.handle_output_moderation_when_task_finished("raw")
 
@@ -242,11 +242,11 @@ class TestBasedGenerateTaskPipeline:
         assert pipeline.output_moderation_handler is None
 
     def test_handle_output_moderation_when_not_flagged(
-        self, pipeline: BasedGenerateTaskPipeline[AppGenerateEntity]
+        self, pipeline: BasedGenerateTaskPipeline[AppGenerateEntity], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         handler = Mock()
         handler.moderation_completion.return_value = ("safe", False)
-        pipeline.output_moderation_handler = handler
+        monkeypatch.setattr(pipeline, "output_moderation_handler", handler)
 
         result = pipeline.handle_output_moderation_when_task_finished("raw")
 
