@@ -677,7 +677,9 @@ def _raise_agent_stream_error_before_response(response, *, context_details: Mapp
     first non-ping event lets the console API relay the stream's status/code and
     diagnostics as an HTTP error. Streaming inputs are closable generation iterators;
     successful streams replay every buffered chunk and close their source on exhaustion
-    or a downstream close, including while replaying buffered chunks.
+    or a downstream close, including while replaying buffered chunks. Complete chunks share
+    the finalize parser: buffer chunks containing only pings, relay any named or JSON error,
+    and otherwise replay the full chunk, including all coalesced events.
     """
     if isinstance(response, Mapping):
         return response
@@ -694,16 +696,19 @@ def _raise_agent_stream_error_before_response(response, *, context_details: Mapp
         if not isinstance(chunk, str):
             return _prepend_stream_chunks(buffered, chunk, iterator)
 
-        if _is_sse_ping(chunk):
-            buffered.append(chunk)
-        else:
-            error_payload = _extract_sse_error_payload(chunk)
-            if error_payload is not None:
+        has_non_ping = False
+        for event_name, payload in _iter_sse_event_payloads(chunk):
+            event = (payload or {}).get("event") or event_name
+            if event == "error":
                 response.close()
                 _raise_http_error_from_sse_error(
-                    error_payload, fallback_message="Agent App chat failed.", context_details=context_details
+                    payload or {}, fallback_message="Agent App chat failed.", context_details=context_details
                 )
+            if event != "ping":
+                has_non_ping = True
+        if has_non_ping:
             return _prepend_stream_chunks(buffered, chunk, iterator)
+        buffered.append(chunk)
 
 
 def _prepend_stream_chunks(
@@ -720,10 +725,6 @@ def _prepend_stream_chunks(
         yield from response
     finally:
         response.close()
-
-
-def _is_sse_ping(chunk: str) -> bool:
-    return chunk.strip() == "event: ping"
 
 
 def _iter_sse_event_payloads(chunk: str) -> Iterator[tuple[str | None, dict[str, Any] | None]]:
@@ -750,14 +751,6 @@ def _iter_sse_event_payloads(chunk: str) -> Iterator[tuple[str | None, dict[str,
             except json.JSONDecodeError:
                 pass
         yield event_name, payload
-
-
-def _extract_sse_error_payload(chunk: str) -> dict[str, Any] | None:
-    """Return the first serialized error in a complete chunk, if one is present."""
-    for event_name, payload in _iter_sse_event_payloads(chunk):
-        if payload is not None and (payload.get("event") or event_name) == "error":
-            return payload
-    return None
 
 
 def _raise_http_error_from_sse_error(
@@ -803,7 +796,8 @@ def _raise_http_error_from_sse_error(
     )
     if status == 400 and code == "completion_request_error":
         exc = CompletionRequestError(message)
-        assert exc.data is not None
-        exc.data["details"] = details
+        if details:
+            assert exc.data is not None
+            exc.data["details"] = details
         raise exc
     raise RelayedHTTPError(status=status, error_code=code, message=message, details=details or None)

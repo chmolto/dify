@@ -10,11 +10,11 @@ from typing import override
 from pydantic import JsonValue
 
 from clients.agent_backend.errors import AgentBackendError, AgentBackendRunFailedError
-from core.app.apps.agent_app.errors import iter_error_causes
 from core.app.apps.agent_chat.generate_response_converter import AgentChatAppGenerateResponseConverter
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
 from core.plugin.impl.exc import PluginDaemonError, PluginInvokeError
 from graphon.model_runtime.errors.invoke import InvokeError
+from libs.exception import iter_error_causes
 
 
 class AgentAppGenerateResponseConverter(AgentChatAppGenerateResponseConverter):

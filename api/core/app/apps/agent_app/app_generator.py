@@ -34,7 +34,6 @@ from core.app.apps.agent_app.app_runner import AgentAppRunner
 from core.app.apps.agent_app.errors import (
     AgentAppGeneratorError,
     AgentAppNotPublishedError,
-    iter_error_causes,
 )
 from core.app.apps.agent_app.generate_response_converter import AgentAppGenerateResponseConverter
 from core.app.apps.agent_app.runtime_request_builder import AgentAppRuntimeRequestBuilder
@@ -56,6 +55,7 @@ from core.logging.context import get_trace_id
 from extensions.ext_database import db
 from extensions.tracing import application_tracing_hooks, create_trace_scope
 from factories import file_factory
+from libs.exception import iter_error_causes
 from models import Account, App, AppModelConfig, Conversation, EndUser, Message, MessageAnnotation
 from models.agent import (
     APP_BACKED_AGENT_SOURCES,

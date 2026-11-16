@@ -142,23 +142,16 @@ class AppGenerateResponseConverter[TBlockingResponse: AppBlockingResponse](ABC):
                 "message": str(e),
             }
 
-        if isinstance(e, AgentBackendHTTPError):
-            return {
-                "code": (e.error_code or "agent_backend_error") if e.status_code >= 400 else "agent_backend_error",
-                "status": e.status_code if e.status_code >= 400 else 502,
-                "message": str(e),
-            }
-
-        if isinstance(e, AgentBackendTransportError | AgentBackendStreamError):
-            return {"code": "agent_backend_unreachable", "status": 502, "message": str(e)}
-
-        if isinstance(e, AgentBackendValidationError):
+        if isinstance(e, AgentBackendHTTPError | AgentBackendValidationError):
             backend_rejection = e.status_code is not None and e.status_code >= 400
             return {
                 "code": (e.error_code or "agent_backend_error") if backend_rejection else "agent_backend_error",
                 "status": e.status_code if backend_rejection else 502,
                 "message": str(e),
             }
+
+        if isinstance(e, AgentBackendTransportError | AgentBackendStreamError):
+            return {"code": "agent_backend_unreachable", "status": 502, "message": str(e)}
 
         if isinstance(e, PluginDaemonInternalError):
             return {"code": "plugin_runtime_error", "status": 502, "message": e.description}

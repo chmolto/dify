@@ -8,12 +8,14 @@ from copy import deepcopy
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from flask import Flask
 from pydantic import JsonValue
 
 from controllers.inner_api import bp as inner_api_bp
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+from core.plugin.impl import base as plugin_base
 from core.plugin.impl.exc import (
     PluginDaemonBadRequestError,
     PluginDaemonClientSideError,
@@ -29,8 +31,10 @@ from core.plugin.impl.exc import (
     PluginRuntimeError,
     PluginUniqueIdentifierError,
 )
+from core.plugin.impl.model_runtime_factory import create_plugin_model_runtime
 from graphon.model_runtime.entities.llm_entities import LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from graphon.model_runtime.entities.message_entities import AssistantPromptMessage, PromptMessage, UserPromptMessage
+from graphon.model_runtime.entities.model_entities import ModelType
 from graphon.model_runtime.errors.invoke import (
     InvokeAuthorizationError,
     InvokeBadRequestError,
@@ -383,6 +387,64 @@ def test_post_preserves_preparation_error_classification(
         code, message = "invalid_model_request", "invalid model"
     assert response.status_code == status
     assert response.get_json() == {"code": code, "message": message, "status": status}
+
+
+def test_post_preserves_model_deserialization_value_errors_as_bad_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_prepare(_self: AgentLLMInnerService, _request: AgentLLMInvokeRequest) -> PreparedAgentLLMInvocation:
+        try:
+            json.loads("invalid model parameters")
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid model parameters") from exc
+        raise AssertionError("the invalid model parameters must fail")
+
+    monkeypatch.setattr(AgentLLMInnerService, "prepare", fail_prepare)
+    with _agent_inner_auth():
+        response = (
+            _flask_app()
+            .test_client()
+            .post("/inner/api/agent/llm/invoke", json=_payload(), headers={"X-Inner-Api-Key": "inner-key"})
+        )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "code": "invalid_model_request",
+        "message": "invalid model parameters",
+        "status": 400,
+    }
+
+
+def test_post_classifies_uncached_plugin_schema_protocol_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow preparation to query a real uncached schema and relay its daemon error as 502."""
+    requests: list[httpx.Request] = []
+
+    def daemon_http(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path.endswith("/dispatch/model/schema")
+        return httpx.Response(200, json={"code": -500, "message": "daemon protocol mismatch", "data": None})
+
+    def prepare(_self: AgentLLMInnerService, request: AgentLLMInvokeRequest) -> PreparedAgentLLMInvocation:
+        runtime = create_plugin_model_runtime(tenant_id=request.caller.tenant_id)
+        runtime.get_model_schema(
+            provider="langgenius/openai/openai", model_type=ModelType.LLM, model="gpt-test", credentials={}
+        )
+        raise AssertionError("the daemon must reject schema loading")
+
+    monkeypatch.setattr(AgentLLMInnerService, "prepare", prepare)
+    with _agent_inner_auth(), httpx.Client(transport=httpx.MockTransport(daemon_http)) as daemon_client:
+        monkeypatch.setattr(plugin_base, "_httpx_client", daemon_client)
+        response = (
+            _flask_app()
+            .test_client()
+            .post("/inner/api/agent/llm/invoke", json=_payload(), headers={"X-Inner-Api-Key": "inner-key"})
+        )
+
+    assert len(requests) == 1
+    assert response.status_code == 502
+    assert response.get_json() == {
+        "code": "agent_llm_invoke_failed",
+        "message": "PluginDaemonInternalError: daemon protocol mismatch",
+        "status": 502,
+    }
 
 
 @pytest.mark.parametrize("emit_partial_chunk", [False, True], ids=["invoke-establishment", "stream-after-chunk"])

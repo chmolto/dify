@@ -1630,14 +1630,25 @@ def test_gateway_http_rate_limit_wrapper_keeps_clean_message_and_backend_reason(
     assert error.__cause__.run_id == "run-1"
 
 
-def test_gateway_http_unclassified_preflight_rejection_keeps_backend_failure() -> None:
+@pytest.mark.parametrize("status", [400, 404])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "App not found.",
+        "AgentLLMInternalError: invalid input",
+        "PluginDaemonInnerError: invalid input",
+        "QuotaExceededError: invalid input",
+        "model_name: gpt-test, InvokeAuthorizationError: invalid input",
+    ],
+)
+def test_gateway_http_unclassified_preflight_rejection_keeps_backend_failure(status: int, body: str) -> None:
+    message = f"status_code: {status}, model_name: gpt-test, body: {body}"
     error = app_runner_module._agent_backend_failure_to_exception(
-        AgentBackendRunFailedInternalEvent(
-            run_id="run-1", error="status_code: 404, model_name: gpt-test, body: App not found.", reason=None
-        )
+        AgentBackendRunFailedInternalEvent(run_id="run-1", error=message, reason=None)
     )
     assert isinstance(error, AgentBackendRunFailedError)
-    assert str(error) == "status_code: 404, model_name: gpt-test, body: App not found. (agent_run_id=run-1)"
+    assert str(error) == f"{message} (agent_run_id=run-1)"
+    assert error.reason is None
 
 
 def test_agent_backend_failure_to_exception_preserves_unknown_reason_context() -> None:

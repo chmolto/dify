@@ -1,11 +1,17 @@
 """Recover legacy plugin-client failures at the Agent LLM gateway boundary only.
 
-The clients keep their ValueError contract for other callers. Gateway invocation must classify
-daemon failures before Graphon re-raises that same ValueError from itself and loses its cause.
+The clients keep their ValueError contract for other callers. Gateway classification recovers
+daemon failures even when Graphon's ValueError self-rethrow replaces the explicit parsing cause.
 """
+
+import json
+import re
+
+from pydantic import ValidationError
 
 from core.plugin.entities.plugin_daemon import PluginDaemonInnerError
 from core.plugin.impl.exc import PluginDaemonInternalError
+from libs.exception import iter_error_causes
 
 _PLUGIN_DAEMON_FAILURE_PREFIXES = (
     "Failed to request plugin daemon,",
@@ -26,8 +32,11 @@ def normalize_agent_llm_plugin_error(
     BasePluginClient translates HTTP transport errors to PluginDaemonInnerError before
     PluginModelClient wraps them; classified plugin errors already propagate unchanged.
     At the plugin stream boundary, a ValueError caused by deserialization errors is also a
-    protocol failure. Named ValueError subclasses retain their own classification. Traversal
-    stops on repeated causes, and daemon messages omit legacy appended numeric error codes.
+    protocol failure. Named ValueError subclasses retain their own classification.
+    Non-streaming daemon error envelopes require both the client's nonzero-code suffix and
+    a JSON/Pydantic parsing failure. The implicit parsing context survives Graphon's explicit
+    self-cause overwrite and is used only with that fixed client wrapper. Traversal stops on
+    repeated causes, and daemon messages omit legacy appended numeric error codes.
     The caller retains the original exception as the cause when raising a replacement.
     """
     fallback = "Request to Plugin Daemon Service failed"
@@ -36,15 +45,16 @@ def normalize_agent_llm_plugin_error(
     if type(error) is not ValueError:
         return None
 
-    cause = error.__cause__
-    seen = {id(error)}
-    while cause is not None and id(cause) not in seen:
-        seen.add(id(cause))
+    for cause in iter_error_causes(error):
         if isinstance(cause, PluginDaemonInnerError):
             return PluginDaemonInternalError(cause.message or fallback)
-        cause = cause.__cause__
 
     message = str(error)
+    daemon_failure = re.fullmatch(r"(.*), code: -?[1-9]\d*", message, re.DOTALL)
+    if daemon_failure is not None and any(
+        isinstance(cause, json.JSONDecodeError | ValidationError) for cause in (error.__cause__, error.__context__)
+    ):
+        return PluginDaemonInternalError(daemon_failure[1] or fallback)
     if message.startswith(_PLUGIN_DAEMON_FAILURE_PREFIXES) or (
         from_plugin_stream and isinstance(error.__cause__, ValueError | TypeError)
     ):

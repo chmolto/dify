@@ -141,7 +141,8 @@ def _agent_backend_failure_to_exception(event: AgentBackendRunFailedInternalEven
     ``Type: message`` (with a model-name prefix in older versions). Preflight ModelHTTPError
     keeps ``status_code: N, model_name: M, body: Type: message`` and may supply a rate-limit
     reason. Strip these wrappers and decode allowlisted types, including nested plugin invoke
-    errors. Gateway HTTP 500 always enters the safe internal-error path.
+    errors. Unrecognized HTTP bodies remain backend failures instead of being parsed as
+    streaming model errors. Gateway HTTP 500 always enters the safe internal-error path.
     A structured runtime failure type takes precedence over gateway interpretation.
     """
     message = event.error or "Agent backend run did not complete successfully."
@@ -177,7 +178,7 @@ def _agent_backend_failure_to_exception(event: AgentBackendRunFailedInternalEven
                 reason, description = body_reason, body_description
             elif status_code == "429" and reason is None:
                 reason = "InvokeRateLimitError"
-    if reason is None:
+    elif reason is None:
         if description.startswith("model_name: "):
             _, _, description = description.partition(", ")
         reason, _, description = description.partition(": ")

@@ -69,7 +69,7 @@ from graphon.model_runtime.entities.message_entities import AssistantPromptMessa
 from graphon.model_runtime.entities.model_entities import AIModelEntity, FetchFrom, ModelPropertyKey, ModelType
 from graphon.model_runtime.entities.provider_entities import ConfigurateMethod, ProviderEntity
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError, InvokeError, InvokeRateLimitError
-from libs.external_api import ExternalApi
+from libs.external_api import ExternalApi, error_responses
 from models.agent import Agent, AgentScope, AgentSource, AgentStatus
 from models.model import AppMode, AppModelConfig
 from models.provider import Provider, ProviderCredential
@@ -590,6 +590,8 @@ def test_chat_preflight_exhaustion_preserves_buffered_frames_and_closes_stream(
 @pytest.mark.parametrize(
     ("chunk", "status", "code"),
     [
+        ("event: error\n\n", 400, "completion_request_error"),
+        ("event: error\ndata: []\n\n", 400, "completion_request_error"),
         (
             ": keepalive\r\nid: event-1\r\nevent: error\r\n"
             'data: {"status": 429,\r\ndata: "code": "rate_limit_error"}\r\n\r\n',
@@ -670,6 +672,57 @@ def test_http_legacy_error_uses_fallback_omits_empty_details_and_closes_retained
     assert "reason" not in body["details"]
     assert observation.stream is not None
     assert observation.closed
+
+
+@pytest.mark.parametrize(
+    "ping_chunk",
+    ["event: ping\n\nevent: ping\n\n", ": keepalive\r\nevent: ping\r\n\r\n", "\n\n"],
+)
+def test_chat_preflight_reads_past_coalesced_or_commented_pings(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    config_overrides: Callable[..., None],
+    ping_chunk: str,
+) -> None:
+    config_overrides(
+        DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY, APP_DEFAULT_ACTIVE_REQUESTS=0, APP_MAX_ACTIVE_REQUESTS=0
+    )
+    response, observation = _post_agent_stream_outcome(
+        sqlite_session,
+        monkeypatch,
+        route="agent_chat",
+        error=None,
+        wire_chunks=(ping_chunk, 'data: {"event":"error","status":429,"code":"rate_limit_error"}\n\n'),
+    )
+
+    assert response.status_code == 429
+    assert response.get_json()["code"] == "rate_limit_error"
+    assert observation.closed
+
+
+def test_http_legacy_stream_error_omits_details_when_no_correlation_is_available() -> None:
+    """Serialize the stream adapter's HTTP error with no request or stream metadata."""
+
+    class AgentStreamApi(Resource):
+        @error_responses(completion_module.CompletionRequestError)
+        def post(self) -> ResponseReturnValue:
+            stream = (chunk for chunk in ['data: {"event":"error"}\n\n'])
+            completion_module._raise_agent_stream_error_before_response(stream, context_details={})
+            raise AssertionError("the error stream must raise before an SSE response starts")
+
+    http_app = Flask(__name__)
+    http_app.config.update(TESTING=True)
+    http_app.before_request(clear_request_context)
+    ExternalApi(http_app).add_resource(AgentStreamApi, "/agent-stream")
+
+    response = http_app.test_client().post("/agent-stream")
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "code": "completion_request_error",
+        "message": "Agent App chat failed.",
+        "status": 400,
+    }
 
 
 @pytest.mark.parametrize("route", ["finalize", "agent_chat"])
@@ -808,7 +861,16 @@ def test_gateway_failure_survives_real_sdk_and_run_failed_to_console_http(
 
 @pytest.mark.parametrize("route", ["finalize", "agent_chat"])
 @pytest.mark.parametrize(
-    "failure_stage", ["preflight", "preflight-invalid-json", "preflight-daemon-error", "invoke", "stream-after-chunk"]
+    "failure_stage",
+    [
+        "preflight",
+        "preflight-invalid-json",
+        "preflight-daemon-error",
+        "preflight-protocol-error",
+        "preflight-invalid-error-shape",
+        "invoke",
+        "stream-after-chunk",
+    ],
 )
 def test_plugin_http_failure_survives_real_clients_graphon_sdk_and_console(
     sqlite_session: Session,
@@ -893,6 +955,9 @@ def test_plugin_http_failure_survives_real_clients_graphon_sdk_and_console(
         if failure_stage == "preflight-daemon-error":
             message = json.dumps({"error_type": "PluginDaemonInnerError", "message": "daemon unavailable"})
             return httpx.Response(200, json={"code": -500, "message": message, "data": None})
+        if failure_stage in {"preflight-protocol-error", "preflight-invalid-error-shape"}:
+            message = "daemon protocol mismatch" if failure_stage == "preflight-protocol-error" else "{}"
+            return httpx.Response(200, json={"code": -500, "message": message, "data": None})
         if request.url.path.endswith("/management/models"):
             return httpx.Response(200, json={"code": 0, "message": "", "data": [provider.model_dump(mode="json")]})
         if request.url.path.endswith("/dispatch/model/schema"):
@@ -924,6 +989,10 @@ def test_plugin_http_failure_survives_real_clients_graphon_sdk_and_console(
         assert body["message"].startswith("Failed to parse response from plugin daemon")
     elif failure_stage == "preflight-daemon-error":
         assert body["message"] == "daemon unavailable"
+    elif failure_stage == "preflight-protocol-error":
+        assert body["message"] == "daemon protocol mismatch"
+    elif failure_stage == "preflight-invalid-error-shape":
+        assert body["message"] == "{}"
     else:
         assert body["message"] == "Request to Plugin Daemon Service failed"
     assert body["details"]["error_source"] == "plugin_daemon"

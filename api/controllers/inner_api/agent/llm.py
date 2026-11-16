@@ -29,7 +29,7 @@ from graphon.model_runtime.errors.invoke import (
     InvokeError,
     InvokeRateLimitError,
 )
-from libs.exception import BaseHTTPException
+from libs.exception import BaseHTTPException, iter_error_causes
 from services.agent_llm_inner_service import AgentLLMInnerService, AgentLLMInnerServiceError
 from services.entities.agent_llm_inner import AgentLLMInvokeRequest
 
@@ -46,11 +46,10 @@ def _normalize_gateway_error(error: Exception) -> BaseException:
     Callers log and chain the original error, keeping the full traceback available server-side.
     """
     target: BaseException = error
-    seen = {id(target)}
-    while type(target) is InvokeError and target.__cause__ is not None and id(target.__cause__) not in seen:
-        target = target.__cause__
-        seen.add(id(target))
-    return normalize_agent_llm_plugin_error(target, from_plugin_stream=False) or target
+    for target in iter_error_causes(error):
+        if type(target) is not InvokeError:
+            return normalize_agent_llm_plugin_error(target, from_plugin_stream=False) or target
+    return target
 
 
 def _preparation_error_status(

@@ -1180,6 +1180,25 @@ def test_daemon_http_failures_are_classified_only_for_gateway_invocations(
             assert str(error) == message_prefix + "-500"
 
 
+def test_non_stream_daemon_protocol_failures_retain_value_error_for_other_callers(
+    monkeypatch: pytest.MonkeyPatch, config_overrides: Callable[..., None]
+) -> None:
+    config_overrides(PLUGIN_MODEL_PROVIDERS_CACHE_ENABLED=False)
+
+    def daemon_http(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": -500, "message": "daemon protocol mismatch", "data": None})
+
+    runtime = create_plugin_model_runtime(tenant_id="tenant")
+    with httpx.Client(transport=httpx.MockTransport(daemon_http)) as daemon_client:
+        monkeypatch.setattr(plugin_base, "_httpx_client", daemon_client)
+        with pytest.raises(ValueError, match="daemon protocol mismatch, code: -500") as caught:
+            runtime.fetch_model_providers()
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == "daemon protocol mismatch, code: -500"
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
 @pytest.mark.parametrize("source", [None, "workflow", "agent_llm_gateway"])
 @pytest.mark.parametrize(
     "error", [PluginDaemonInnerError(code=-500, message="daemon unavailable"), ValueError("invalid model")]

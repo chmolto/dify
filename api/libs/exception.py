@@ -1,7 +1,20 @@
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from werkzeug.exceptions import HTTPException
+
+
+def iter_error_causes(error: BaseException) -> Iterator[BaseException]:
+    """Yield an exception and its explicit causes once, in order, stopping before any cycle.
+
+    Implicit contexts are excluded; traversal neither mutates exceptions nor follows a cause twice.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__
 
 
 class BaseHTTPException(HTTPException):

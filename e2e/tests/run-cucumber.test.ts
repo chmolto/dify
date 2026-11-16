@@ -103,6 +103,23 @@ describe('core E2E preparation', () => {
     expect(captureMiddlewareLogs).toHaveBeenCalledBefore(vi.mocked(stopMiddleware))
   })
 
+  it('waits for log capture to finish before stopping middleware', async () => {
+    let finishCapture!: () => void
+    vi.mocked(captureMiddlewareLogs).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishCapture = resolve
+      }),
+    )
+
+    const run = runCucumber(['--full'])
+    await vi.waitFor(() => expect(captureMiddlewareLogs).toHaveBeenCalledOnce())
+    expect(stopMiddleware).not.toHaveBeenCalled()
+
+    finishCapture()
+    await run
+    expect(stopMiddleware).toHaveBeenCalledOnce()
+  })
+
   it('fails closed and tears down the backend when artifact preparation fails', async () => {
     const error = new Error('Web build producer failed')
     vi.mocked(startWebBuildDownload).mockResolvedValue({
